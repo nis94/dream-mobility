@@ -70,8 +70,12 @@ fmt: ## Format Go code
 	goimports -w .
 
 .PHONY: gen
-gen: ## Run code generators (Avro, mocks, etc.) -- populated in Phase 1
-	@echo "Phase 1 will populate this target with: go generate ./..."
+gen: ## Regenerate Go types from Avro schemas (requires avrogen: go install github.com/hamba/avro/v2/cmd/avrogen@latest)
+	go generate ./...
+
+.PHONY: register-schemas
+register-schemas: ## Register Avro schemas with the Schema Registry (stack must be running)
+	./scripts/register-schemas.sh
 
 # ---- Python generator --------------------------------------------------------
 
