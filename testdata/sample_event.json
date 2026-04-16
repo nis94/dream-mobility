@@ -1,0 +1,17 @@
+{
+  "event_id": "550e8400-e29b-41d4-a716-446655440000",
+  "entity": {
+    "type": "vehicle",
+    "id": "vehicle-123"
+  },
+  "timestamp": "2025-01-01T10:15:00Z",
+  "position": {
+    "lat": 52.5200,
+    "lon": 13.4050
+  },
+  "speed_kmh": 42.3,
+  "source": "gps",
+  "attributes": {
+    "battery_level": 0.82
+  }
+}
