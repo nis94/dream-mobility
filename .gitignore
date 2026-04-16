@@ -16,6 +16,6 @@ deploy/data/
 
 # Generated code is checked in; do not ignore *.pb.go
 
-# Interview materials (private — do not push to public repo)
-task.pdf
-job_description.txt
+
+
+

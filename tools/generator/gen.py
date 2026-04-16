@@ -1,7 +1,7 @@
 """
 Synthetic movement event generator for the Dream Mobility ingestion pipeline.
 
-Emits JSON events shaped like the example in task.pdf:
+Emits JSON events shaped like:
 
     {
       "event_id": "<uuid>",

@@ -1,25 +1,28 @@
+version: "2"
+
 run:
   timeout: 5m
-  tests: true
 
 linters:
-  disable-all: true
+  default: none
   enable:
     - errcheck
     - govet
     - staticcheck
     - ineffassign
     - unused
-    - gofmt
-    - goimports
     - misspell
     - unconvert
     - unparam
+  exclusions:
+    paths:
+      - proto
+    rules:
+      - path: _test\.go
+        linters:
+          - unparam
 
-issues:
-  exclude-dirs:
-    - proto
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - unparam
+formatters:
+  enable:
+    - gofmt
+    - goimports
