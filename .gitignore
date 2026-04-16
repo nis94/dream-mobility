@@ -1,0 +1,21 @@
+bin/
+dist/
+vendor/
+*.test
+*.out
+.env
+.env.*
+coverage.*
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Docker / compose
+deploy/data/
+
+# Generated code is checked in; do not ignore *.pb.go
+
+# Interview materials (private — do not push to public repo)
+task.pdf
+job_description.txt

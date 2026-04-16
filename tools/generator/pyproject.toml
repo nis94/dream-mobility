@@ -1,0 +1,21 @@
+[project]
+name = "dream-mobility-generator"
+version = "0.1.0"
+description = "Synthetic GPS-like movement event generator for the Dream Mobility ingestion pipeline."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "W", "UP", "SIM"]

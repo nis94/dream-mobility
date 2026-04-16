@@ -1,0 +1,220 @@
+# Local development stack for the Dream Mobility project.
+# All services run on a single bridge network. `make up` waits for healthy
+# state; `make down-v` wipes volumes.
+#
+# Port allocation (host -> container):
+#   29092 -> 9092   Kafka (PLAINTEXT_HOST listener for client tools)
+#   8081  -> 8081   Confluent Schema Registry
+#   5432  -> 5432   Postgres
+#   8123  -> 8123   ClickHouse HTTP
+#   9000  -> 9000   ClickHouse native protocol
+#   9100  -> 9000   MinIO S3 API
+#   9101  -> 9001   MinIO console
+#   8181  -> 8181   Apache Iceberg REST catalog
+#   8088  -> 8080   Kafka UI
+
+name: dream-mobility
+
+x-healthcheck-defaults: &hc-defaults
+  interval: 5s
+  timeout: 5s
+  retries: 30
+  start_period: 10s
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Kafka (KRaft mode -- no Zookeeper)
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    hostname: kafka
+    container_name: dm-kafka
+    environment:
+      # KRaft: this single node plays both roles
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:9093'
+      # Listeners:
+      #   PLAINTEXT       -- intra-cluster + service-to-service inside the docker network
+      #   CONTROLLER      -- KRaft control plane
+      #   PLAINTEXT_HOST  -- exposed to host on 29092 for kcat/CLI tools
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:29092'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      # Single-node defaults
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_LOG_RETENTION_HOURS: 168
+      # Stable cluster id (base64-encoded UUID); pinning it keeps volumes reusable across restarts.
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qg'
+    ports:
+      - "29092:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+
+  # ---------------------------------------------------------------------------
+  # Confluent Schema Registry (Avro contract enforcement)
+  # ---------------------------------------------------------------------------
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    hostname: schema-registry
+    container_name: dm-schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: backward
+    ports:
+      - "8081:8081"
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/subjects >/dev/null"]
+
+  # ---------------------------------------------------------------------------
+  # Kafka UI (Provectus) -- optional, helpful for poking topics during dev
+  # ---------------------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: dm-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: dream-mobility
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      DYNAMIC_CONFIG_ENABLED: 'true'
+    ports:
+      - "8088:8080"
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/ || exit 1"]
+
+  # ---------------------------------------------------------------------------
+  # Postgres -- hot state (raw_events dedupe, entity_positions last-known-pos)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    hostname: postgres
+    container_name: dm-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: mobility
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mobility"]
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse -- analytical store (raw_events + materialized rollups)
+  # ---------------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    hostname: clickhouse
+    container_name: dm-clickhouse
+    environment:
+      CLICKHOUSE_DB: mobility
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      CLICKHOUSE_PASSWORD: ""
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8123/ping | grep -q Ok"]
+
+  # ---------------------------------------------------------------------------
+  # MinIO -- S3-compatible object store; backs the Iceberg lake
+  # Host port 9100 (API) chosen to avoid clash with ClickHouse native (9000).
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
+    hostname: minio
+    container_name: dm-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live >/dev/null"]
+
+  # ---------------------------------------------------------------------------
+  # MinIO bootstrap -- creates the `lake` bucket for Iceberg, then exits
+  # ---------------------------------------------------------------------------
+  minio-init:
+    image: minio/mc:RELEASE.2024-09-16T17-43-14Z
+    container_name: dm-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb -p local/lake || true &&
+      mc anonymous set download local/lake || true &&
+      echo 'MinIO bootstrap done.';
+      "
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Apache Iceberg REST catalog -- serves table metadata over HTTP, backed by MinIO
+  # ---------------------------------------------------------------------------
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    hostname: iceberg-rest
+    container_name: dm-iceberg-rest
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://lake/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: 'true'
+    ports:
+      - "8181:8181"
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/8181"]
+
+volumes:
+  kafka-data:
+  postgres-data:
+  clickhouse-data:
+  minio-data:
