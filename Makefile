@@ -98,6 +98,22 @@ generator-run: ## Run the synthetic event generator (override ARGS=...)
 e2e: ## End-to-end test against the running stack -- populated in Phase 3
 	@echo "Phase 3 will populate this target with the dedupe + out-of-order correctness test"
 
+.PHONY: smoke
+smoke: ## Smoke-test the ingest-api against the running stack (auto-starts API if needed)
+	./scripts/smoke-api.sh
+
+.PHONY: sr-state
+sr-state: ## Dump Schema Registry state (subjects, config, per-subject fields). Use ARGS=--probe-evolution to check forward compat.
+	./scripts/sr-state.sh $(ARGS)
+
+.PHONY: verify
+verify: ## Full verification battery: build, vet, race tests, compose config
+	go build ./...
+	go vet ./...
+	go test -race -count=1 ./...
+	$(COMPOSE) config --quiet
+	@echo "verify: OK"
+
 # ---- Cleanliness -------------------------------------------------------------
 
 .PHONY: clean
