@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,17 +13,27 @@ import (
 	"time"
 
 	"github.com/nis94/dream-mobility/internal/avro"
-	"github.com/nis94/dream-mobility/internal/producer"
 )
+
+// maxRequestBody caps the POST body size. Oversized requests are rejected with
+// HTTP 413 via http.MaxBytesReader's typed error.
+const maxRequestBody = 10 << 20 // 10 MiB
+
+// eventProducer is the handler's narrow dependency on the Kafka producer.
+// Defined here (consumer side) so tests can supply a fake without pulling in
+// the real kafka.Writer machinery.
+type eventProducer interface {
+	Produce(ctx context.Context, event *avro.MovementEvent) error
+}
 
 // Handler serves the ingestion HTTP endpoints.
 type Handler struct {
-	producer *producer.Producer
+	producer eventProducer
 	logger   *slog.Logger
 }
 
-// NewHandler creates a Handler wired to the given Kafka producer.
-func NewHandler(p *producer.Producer, logger *slog.Logger) *Handler {
+// NewHandler creates a Handler wired to the given event producer.
+func NewHandler(p eventProducer, logger *slog.Logger) *Handler {
 	return &Handler{producer: p, logger: logger}
 }
 
@@ -29,26 +42,44 @@ func NewHandler(p *producer.Producer, logger *slog.Logger) *Handler {
 //   - Single event:  { "event_id": "...", ... }
 //   - Batch wrapper: { "events": [ {...}, {...} ] }
 //   - Raw array:     [ {...}, {...} ]
+//
+// Bodies larger than maxRequestBody are rejected with 413. Non-JSON
+// Content-Type (when present and not empty) is rejected with 415.
 func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
-	events, err := parseRequestBody(r)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	if ct := r.Header.Get("Content-Type"); ct != "" && !strings.HasPrefix(ct, "application/json") {
+		h.writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "Content-Type must be application/json"})
 		return
 	}
 
-	resp := IngestResponse{}
-	for i, ev := range events {
-		if msg := ValidateEvent(&ev); msg != "" {
+	events, err := h.parseRequestBody(w, r)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			h.writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
+				"error": fmt.Sprintf("request body exceeds %d bytes", maxErr.Limit),
+			})
+			return
+		}
+		h.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	resp := IngestResponse{Errors: make([]EventError, 0, len(events))}
+	for i := range events {
+		ev := &events[i]
+
+		ts, err := ValidateEvent(ev)
+		if err != nil {
 			resp.Rejected++
 			resp.Errors = append(resp.Errors, EventError{
 				Index:   i,
 				EventID: ev.EventID,
-				Error:   msg,
+				Error:   err.Error(),
 			})
 			continue
 		}
 
-		avroEvent := mapToAvro(&ev)
+		avroEvent := mapToAvro(ev, ts)
 		if err := h.producer.Produce(r.Context(), avroEvent); err != nil {
 			h.logger.Error("kafka produce failed", "event_id", ev.EventID, "err", err)
 			resp.Rejected++
@@ -59,7 +90,6 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
-
 		resp.Accepted++
 	}
 
@@ -67,13 +97,17 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 	if resp.Accepted == 0 && resp.Rejected > 0 {
 		status = http.StatusBadRequest
 	}
-	writeJSON(w, status, resp)
+	h.writeJSON(w, status, resp)
 }
 
-// parseRequestBody reads the full body and delegates to parseEventsFromBytes.
-func parseRequestBody(r *http.Request) ([]EventRequest, error) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20)) // 10 MB max
+// parseRequestBody reads up to maxRequestBody from the request and delegates
+// to parseEventsFromBytes. The returned error may wrap *http.MaxBytesError
+// (see errors.As in Ingest) for oversized bodies.
+func (h *Handler) parseRequestBody(w http.ResponseWriter, r *http.Request) ([]EventRequest, error) {
+	reader := http.MaxBytesReader(w, r.Body, maxRequestBody)
 	defer r.Body.Close()
+
+	body, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
@@ -81,9 +115,12 @@ func parseRequestBody(r *http.Request) ([]EventRequest, error) {
 }
 
 // parseEventsFromBytes detects whether the raw JSON is a single event, a batch
-// wrapper {"events": [...]}, or a raw array [...].
+// wrapper {"events": [...]}, or a raw array [...], and decodes accordingly.
+// An empty batch wrapper ({"events":[]}) is treated as a well-formed no-op
+// and returns an empty slice (distinct from a missing "events" key, which
+// falls back to single-event decoding).
 func parseEventsFromBytes(body []byte) ([]EventRequest, error) {
-	trimmed := strings.TrimSpace(string(body))
+	trimmed := bytes.TrimLeft(body, " \t\r\n\v\f")
 	if len(trimmed) == 0 {
 		return nil, fmt.Errorf("empty body")
 	}
@@ -97,12 +134,23 @@ func parseEventsFromBytes(body []byte) ([]EventRequest, error) {
 		return events, nil
 
 	case '{':
-		// Try batch wrapper first: {"events": [...]}
-		var batch BatchRequest
-		if err := json.Unmarshal(body, &batch); err == nil && len(batch.Events) > 0 {
-			return batch.Events, nil
+		// Peek for the "events" key via json.RawMessage. Non-nil means the key
+		// was present in the input (even if its value is null or []), in which
+		// case this is a batch wrapper — not a single event.
+		var peek struct {
+			Events json.RawMessage `json:"events"`
 		}
-		// Fall back to single event.
+		if err := json.Unmarshal(body, &peek); err != nil {
+			return nil, fmt.Errorf("invalid JSON object: %w", err)
+		}
+		if peek.Events != nil {
+			var events []EventRequest
+			if err := json.Unmarshal(peek.Events, &events); err != nil {
+				return nil, fmt.Errorf("invalid JSON in events array: %w", err)
+			}
+			return events, nil
+		}
+		// No "events" key → single event.
 		var ev EventRequest
 		if err := json.Unmarshal(body, &ev); err != nil {
 			return nil, fmt.Errorf("invalid JSON object: %w", err)
@@ -115,9 +163,9 @@ func parseEventsFromBytes(body []byte) ([]EventRequest, error) {
 }
 
 // mapToAvro converts the nested JSON request to the flat Avro struct.
-func mapToAvro(ev *EventRequest) *avro.MovementEvent {
-	ts, _ := time.Parse(time.RFC3339Nano, ev.Timestamp) // already validated
-
+// ts is the already-parsed timestamp from ValidateEvent; avoids a redundant
+// time.Parse here.
+func mapToAvro(ev *EventRequest, ts time.Time) *avro.MovementEvent {
 	m := &avro.MovementEvent{
 		EventID:    ev.EventID,
 		EntityType: ev.Entity.Type,
@@ -140,8 +188,13 @@ func mapToAvro(ev *EventRequest) *avro.MovementEvent {
 	return m
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+// writeJSON sets the Content-Type + status and encodes v. Encode errors
+// after the status line has been flushed cannot repair the response but
+// are logged for operability (truncated body visibility).
+func (h *Handler) writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		h.logger.Warn("response encode failed", "err", err)
+	}
 }

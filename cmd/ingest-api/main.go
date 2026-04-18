@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -20,7 +22,11 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		logger.Error("failed to load config", "err", err)
+		os.Exit(1)
+	}
 
 	// Graceful shutdown on SIGINT/SIGTERM. Created early so producer startup
 	// (SR schema registration with retries) is bounded by the same signal.
@@ -33,9 +39,12 @@ func main() {
 		logger.Error("failed to create producer", "err", err)
 		os.Exit(1)
 	}
-	defer prod.Close()
+	defer func() {
+		if err := prod.Close(); err != nil {
+			logger.Error("producer close failed", "err", err)
+		}
+	}()
 
-	// HTTP handler.
 	h := api.NewHandler(prod, logger)
 
 	r := chi.NewRouter()
@@ -44,9 +53,9 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
 
-	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = io.WriteString(w, "ok")
 	})
 	r.Post("/events", h.Ingest)
 
@@ -58,16 +67,23 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	// The server goroutine reports only unexpected errors via srvErr.
+	// http.ErrServerClosed is the normal return from Shutdown and is filtered.
+	srvErr := make(chan error, 1)
 	go func() {
 		logger.Info("ingest-api starting", "addr", srv.Addr, "kafka", cfg.KafkaBrokers, "topic", cfg.KafkaTopic)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("http server error", "err", err)
-			os.Exit(1)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			srvErr <- err
 		}
+		close(srvErr)
 	}()
 
-	<-ctx.Done()
-	logger.Info("shutting down")
+	select {
+	case <-ctx.Done():
+		logger.Info("shutting down", "signal", ctx.Err())
+	case err := <-srvErr:
+		logger.Error("http server error", "err", err)
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

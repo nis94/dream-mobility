@@ -18,8 +18,12 @@ func validEvent() EventRequest {
 
 func TestValidateEvent_Valid(t *testing.T) {
 	e := validEvent()
-	if msg := ValidateEvent(&e); msg != "" {
-		t.Errorf("expected valid, got: %s", msg)
+	ts, err := ValidateEvent(&e)
+	if err != nil {
+		t.Errorf("expected valid, got: %v", err)
+	}
+	if ts.IsZero() {
+		t.Error("expected non-zero parsed timestamp on success")
 	}
 }
 
@@ -29,8 +33,21 @@ func TestValidateEvent_ValidWithOptionals(t *testing.T) {
 	e.HeadingDeg = ptr(137.5)
 	e.AccuracyM = ptr(4.2)
 	e.Source = ptr("gps")
-	if msg := ValidateEvent(&e); msg != "" {
-		t.Errorf("expected valid, got: %s", msg)
+	if _, err := ValidateEvent(&e); err != nil {
+		t.Errorf("expected valid, got: %v", err)
+	}
+}
+
+func TestValidateEvent_ReturnedTimestampMatchesInput(t *testing.T) {
+	e := validEvent()
+	e.Timestamp = "2025-03-15T12:34:56.789Z"
+	ts, err := ValidateEvent(&e)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := time.Date(2025, 3, 15, 12, 34, 56, 789_000_000, time.UTC)
+	if !ts.Equal(want) {
+		t.Errorf("ts = %v, want %v", ts, want)
 	}
 }
 
@@ -49,9 +66,9 @@ func TestValidateEvent_MissingRequired(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			e := validEvent()
 			tt.mod(&e)
-			msg := ValidateEvent(&e)
-			if msg != tt.want {
-				t.Errorf("got %q, want %q", msg, tt.want)
+			_, err := ValidateEvent(&e)
+			if err == nil || err.Error() != tt.want {
+				t.Errorf("got %v, want %q", err, tt.want)
 			}
 		})
 	}
@@ -60,7 +77,7 @@ func TestValidateEvent_MissingRequired(t *testing.T) {
 func TestValidateEvent_BadTimestamp(t *testing.T) {
 	e := validEvent()
 	e.Timestamp = "not-a-date"
-	if msg := ValidateEvent(&e); msg == "" {
+	if _, err := ValidateEvent(&e); err == nil {
 		t.Error("expected error for bad timestamp")
 	}
 }
@@ -68,8 +85,7 @@ func TestValidateEvent_BadTimestamp(t *testing.T) {
 func TestValidateEvent_FutureTimestamp(t *testing.T) {
 	e := validEvent()
 	e.Timestamp = time.Now().Add(25 * time.Hour).UTC().Format(time.RFC3339Nano)
-	msg := ValidateEvent(&e)
-	if msg == "" {
+	if _, err := ValidateEvent(&e); err == nil {
 		t.Error("expected error for future timestamp")
 	}
 }
@@ -86,7 +102,7 @@ func TestValidateEvent_LatOutOfRange(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			e := validEvent()
 			e.Position.Lat = tt.lat
-			if msg := ValidateEvent(&e); msg == "" {
+			if _, err := ValidateEvent(&e); err == nil {
 				t.Error("expected error for lat out of range")
 			}
 		})
@@ -96,7 +112,7 @@ func TestValidateEvent_LatOutOfRange(t *testing.T) {
 func TestValidateEvent_LonOutOfRange(t *testing.T) {
 	e := validEvent()
 	e.Position.Lon = 181.0
-	if msg := ValidateEvent(&e); msg == "" {
+	if _, err := ValidateEvent(&e); err == nil {
 		t.Error("expected error for lon out of range")
 	}
 }
@@ -104,7 +120,7 @@ func TestValidateEvent_LonOutOfRange(t *testing.T) {
 func TestValidateEvent_NegativeSpeed(t *testing.T) {
 	e := validEvent()
 	e.SpeedKmh = ptr(-1.0)
-	if msg := ValidateEvent(&e); msg == "" {
+	if _, err := ValidateEvent(&e); err == nil {
 		t.Error("expected error for negative speed")
 	}
 }
@@ -112,7 +128,7 @@ func TestValidateEvent_NegativeSpeed(t *testing.T) {
 func TestValidateEvent_HeadingOutOfRange(t *testing.T) {
 	e := validEvent()
 	e.HeadingDeg = ptr(360.0)
-	if msg := ValidateEvent(&e); msg == "" {
+	if _, err := ValidateEvent(&e); err == nil {
 		t.Error("expected error for heading >= 360")
 	}
 }
@@ -120,7 +136,7 @@ func TestValidateEvent_HeadingOutOfRange(t *testing.T) {
 func TestValidateEvent_NegativeAccuracy(t *testing.T) {
 	e := validEvent()
 	e.AccuracyM = ptr(-0.5)
-	if msg := ValidateEvent(&e); msg == "" {
+	if _, err := ValidateEvent(&e); err == nil {
 		t.Error("expected error for negative accuracy")
 	}
 }
