@@ -16,34 +16,44 @@ register() {
   local subject="$1"
   local schema_file="$2"
 
+  if [[ ! -r "$schema_file" ]]; then
+    echo "schema file not readable: $schema_file" >&2
+    exit 2
+  fi
+
   # Schema Registry expects the Avro schema JSON-encoded inside a wrapper object.
-  # jq -Rs reads the file as a raw string; we embed it in {"schema": "..."}.
+  # jq -n builds a new object; --arg binds $schema to the file contents
+  # as a string, escaping shell quoting hazards.
   local payload
-  payload=$(jq -n --arg schema "$(cat "$schema_file")" '{"schemaType": "AVRO", "schema": $schema}')
+  payload=$(jq -n --arg schema "$(cat "$schema_file")" \
+    '{"schemaType": "AVRO", "schema": $schema}')
 
   echo -n "Registering subject '${subject}' ... "
-  local http_code
-  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+
+  # One POST, capture both body and HTTP code: append the code on a new line
+  # via curl -w, then split.
+  local response http_code body
+  response=$(curl -sS -w '\n%{http_code}' \
     -X POST \
     -H "Content-Type: application/vnd.schemaregistry.v1+json" \
     -d "$payload" \
     "${SR_URL}/subjects/${subject}/versions")
+  http_code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
 
-  if [[ "$http_code" == "200" ]]; then
-    echo "OK (registered/updated)"
-  elif [[ "$http_code" == "409" ]]; then
-    echo "OK (already exists, compatible)"
-  else
-    echo "FAILED (HTTP ${http_code})"
-    # Print the full response for debugging
-    curl -s \
-      -X POST \
-      -H "Content-Type: application/vnd.schemaregistry.v1+json" \
-      -d "$payload" \
-      "${SR_URL}/subjects/${subject}/versions"
-    echo
-    exit 1
-  fi
+  case "$http_code" in
+    200)
+      echo "OK (registered/updated)"
+      ;;
+    409)
+      echo "OK (already exists, compatible)"
+      ;;
+    *)
+      echo "FAILED (HTTP ${http_code})"
+      echo "${body}" >&2
+      exit 1
+      ;;
+  esac
 }
 
 echo "Schema Registry: ${SR_URL}"

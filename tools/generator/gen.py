@@ -37,6 +37,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import random
 import sys
 import uuid
@@ -86,20 +87,14 @@ class Entity:
 
 
 def _deg_to_rad(d: float) -> float:
-    import math
-
     return d * math.pi / 180.0
 
 
 def _cos(x: float) -> float:
-    import math
-
     return math.cos(x)
 
 
 def _sin(x: float) -> float:
-    import math
-
     return math.sin(x)
 
 
@@ -130,7 +125,7 @@ def event_from(entity: Entity, when: datetime, rng: random.Random) -> dict[str, 
     payload: dict[str, Any] = {
         "event_id": str(uuid.uuid4()),
         "entity": {"type": entity.type, "id": entity.id},
-        "timestamp": when.replace(tzinfo=UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "timestamp": when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "position": {"lat": round(entity.lat, 6), "lon": round(entity.lon, 6)},
     }
     # Optional fields, sometimes omitted (mirrors task spec: "may contain optional or missing fields")
@@ -248,6 +243,15 @@ async def run(args: argparse.Namespace) -> None:
             now = datetime.now(UTC)
             batch: list[dict[str, Any]] = []
             for _ in range(args.batch_size):
+                # Either emit a duplicate of a recently-seen event (keeping
+                # batch size honest: one roll → one slot), or build a fresh
+                # event. On the first few iterations `recent` is empty, so
+                # the duplicate branch never fires.
+                if recent and rng.random() < args.duplicates:
+                    batch.append(rng.choice(recent))
+                    duplicates_emitted += 1
+                    continue
+
                 ent = rng.choice(entities)
                 ts = now
                 if rng.random() < args.out_of_order:
@@ -256,11 +260,6 @@ async def run(args: argparse.Namespace) -> None:
                     out_of_order_emitted += 1
                 ev = event_from(ent, ts, rng)
                 batch.append(ev)
-
-                # Optionally duplicate a previously-emitted event into this batch
-                if recent and rng.random() < args.duplicates:
-                    batch.append(rng.choice(recent))
-                    duplicates_emitted += 1
 
                 recent.append(ev)
                 if len(recent) > recent_max:

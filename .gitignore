@@ -15,7 +15,3 @@ coverage.*
 deploy/data/
 
 # Generated code is checked in; do not ignore *.pb.go
-
-
-
-
