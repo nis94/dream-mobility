@@ -2,6 +2,11 @@
 # All services run on a single bridge network. `make up` waits for healthy
 # state; `make down-v` wipes volumes.
 #
+# DEV-ONLY ENVIRONMENT — all credentials below (minioadmin/minioadmin,
+# postgres/postgres, ClickHouse no-password, no TLS, anonymous MinIO reads)
+# are acceptable for local development only. Do NOT promote this file to
+# staging or production without the delta documented in the infra review.
+#
 # Port allocation (host -> container):
 #   29092 -> 9092   Kafka (PLAINTEXT_HOST listener for client tools)
 #   8081  -> 8081   Confluent Schema Registry
@@ -35,7 +40,7 @@ services:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: 'broker,controller'
       KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:9093'
-      # Listeners:
+      # Listeners (all plaintext: DEV-ONLY — prod uses SASL/TLS):
       #   PLAINTEXT       -- intra-cluster + service-to-service inside the docker network
       #   CONTROLLER      -- KRaft control plane
       #   PLAINTEXT_HOST  -- exposed to host on 29092 for kcat/CLI tools
@@ -49,7 +54,10 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      # Auto-create disabled: kafka-init is the authoritative topic owner.
+      # A producer hitting an unknown topic should fail loudly, not silently
+      # create a 1-partition topic that breaks per-entity ordering.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
       KAFKA_LOG_RETENTION_HOURS: 168
       # Stable cluster id (base64-encoded UUID); pinning it keeps volumes reusable across restarts.
       CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qg'
@@ -60,6 +68,37 @@ services:
     healthcheck:
       <<: *hc-defaults
       test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+
+  # ---------------------------------------------------------------------------
+  # Kafka bootstrap -- creates the `movement.events` topic, then exits.
+  # The authoritative topic owner now that KAFKA_AUTO_CREATE_TOPICS_ENABLE is
+  # disabled. Partitions = 3: producer keys by entity_type:entity_id with the
+  # Murmur2 balancer, so 3 partitions give per-entity ordering plus
+  # parallelism for local dev.
+  #
+  # TODO: when the ingest-api gains a compose service entry, it MUST add
+  #   depends_on:
+  #     kafka-init:
+  #       condition: service_completed_successfully
+  # Otherwise the producer can race kafka-init and hit "unknown topic".
+  # ---------------------------------------------------------------------------
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: dm-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: |
+      /bin/sh -c '
+      set -e
+      kafka-topics --bootstrap-server kafka:9092 \
+        --create --if-not-exists \
+        --topic movement.events \
+        --partitions 3 \
+        --replication-factor 1
+      echo "Kafka bootstrap done."
+      '
+    restart: "no"
 
   # ---------------------------------------------------------------------------
   # Confluent Schema Registry (Avro contract enforcement)
@@ -87,13 +126,19 @@ services:
   # Kafka UI (Provectus) -- optional, helpful for poking topics during dev
   # ---------------------------------------------------------------------------
   kafka-ui:
-    image: provectuslabs/kafka-ui:latest
+    # Digest-pinned for reproducibility. Replace with a semver tag once the
+    # project publishes one we want to track (e.g. provectuslabs/kafka-ui:v1.x).
+    image: provectuslabs/kafka-ui@sha256:8f2ff02d64b0a7a2b71b6b3b3148b85f66d00ec20ad40c30bdcd415d46d31818
     container_name: dm-kafka-ui
     depends_on:
       kafka:
         condition: service_healthy
       schema-registry:
         condition: service_healthy
+      # Also gates `docker compose up --wait` on kafka-init's successful exit,
+      # so `make up` reports failure if topic creation fails.
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_CLUSTERS_0_NAME: dream-mobility
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
@@ -113,6 +158,7 @@ services:
     hostname: postgres
     container_name: dm-postgres
     environment:
+      # DEV-ONLY credentials.
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: mobility
@@ -160,6 +206,7 @@ services:
     container_name: dm-minio
     command: server /data --console-address ":9001"
     environment:
+      # DEV-ONLY credentials.
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
@@ -187,6 +234,9 @@ services:
       mc anonymous set download local/lake || true &&
       echo 'MinIO bootstrap done.';
       "
+    # DEV-ONLY: `mc anonymous set download` grants public read on the lake
+    # bucket. Convenient for local poking; in any non-local environment this
+    # must be replaced with IAM/role-scoped access and the bucket kept private.
     restart: "no"
 
   # ---------------------------------------------------------------------------

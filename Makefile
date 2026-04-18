@@ -75,6 +75,11 @@ gen: ## Regenerate Go types from Avro schemas (requires avrogen: go install gith
 
 .PHONY: register-schemas
 register-schemas: ## Register Avro schemas with the Schema Registry (stack must be running)
+	@command -v jq >/dev/null || { echo "jq is required but not installed (brew install jq)"; exit 1; }
+	@curl -fsS --max-time 2 http://localhost:8081/subjects >/dev/null 2>&1 || { \
+		echo "Schema Registry unreachable at http://localhost:8081 — run 'make up' first"; \
+		exit 1; \
+	}
 	./scripts/register-schemas.sh
 
 # ---- Python generator --------------------------------------------------------
