@@ -159,7 +159,7 @@ func postSchema(ctx context.Context, url string, payload []byte) (id int, retria
 	if err != nil {
 		return 0, true, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	switch {
 	case resp.StatusCode == http.StatusOK:

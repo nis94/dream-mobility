@@ -128,7 +128,7 @@ def event_from(entity: Entity, when: datetime, rng: random.Random) -> dict[str, 
         "timestamp": when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "position": {"lat": round(entity.lat, 6), "lon": round(entity.lon, 6)},
     }
-    # Optional fields, sometimes omitted (mirrors task spec: "may contain optional or missing fields")
+    # Optional fields, sometimes omitted (mirrors the "optional or missing fields" spec).
     if rng.random() < 0.9:
         payload["speed_kmh"] = round(entity.speed_kmh, 2)
     if rng.random() < 0.7:
@@ -162,7 +162,10 @@ class StdoutSink(Sink):
 
 class FileSink(Sink):
     def __init__(self, path: str) -> None:
-        self._fh = open(path, "a", buffering=1)
+        # Open once, write many, close once: streaming sink pattern, not a
+        # leaked file handle (see close() below). ruff's SIM115 expects a
+        # context manager which doesn't fit the open-across-async-emits shape.
+        self._fh = open(path, "a", buffering=1)  # noqa: SIM115
 
     async def emit(self, events: list[dict[str, Any]]) -> None:
         for e in events:

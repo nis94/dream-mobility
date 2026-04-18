@@ -105,7 +105,7 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 // (see errors.As in Ingest) for oversized bodies.
 func (h *Handler) parseRequestBody(w http.ResponseWriter, r *http.Request) ([]EventRequest, error) {
 	reader := http.MaxBytesReader(w, r.Body, maxRequestBody)
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 
 	body, err := io.ReadAll(reader)
 	if err != nil {
