@@ -33,7 +33,7 @@ type MovementEvent struct {
 	Attributes *string `avro:"attributes"`
 }
 
-var schemaMovementEvent = avro.MustParse(`{"name":"com.dreammobility.MovementEvent","type":"record","fields":[{"name":"event_id","type":"string"},{"name":"entity_type","type":"string"},{"name":"entity_id","type":"string"},{"name":"timestamp","type":{"type":"long","logicalType":"timestamp-micros"}},{"name":"lat","type":"double"},{"name":"lon","type":"double"},{"name":"speed_kmh","type":["null","double"]},{"name":"heading_deg","type":["null","double"]},{"name":"accuracy_m","type":["null","double"]},{"name":"source","type":["null","string"]},{"name":"attributes","type":["null","string"]}]}`)
+var schemaMovementEvent = avro.MustParse(`{"name":"com.dreammobility.MovementEvent","type":"record","fields":[{"name":"event_id","type":{"type":"string","logicalType":"uuid"}},{"name":"entity_type","type":"string"},{"name":"entity_id","type":"string"},{"name":"timestamp","type":{"type":"long","logicalType":"timestamp-micros"}},{"name":"lat","type":"double"},{"name":"lon","type":"double"},{"name":"speed_kmh","type":["null","double"]},{"name":"heading_deg","type":["null","double"]},{"name":"accuracy_m","type":["null","double"]},{"name":"source","type":["null","string"]},{"name":"attributes","type":["null","string"]}]}`)
 
 // Schema returns the schema for MovementEvent.
 func (o *MovementEvent) Schema() avro.Schema {

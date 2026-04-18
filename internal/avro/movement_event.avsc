@@ -6,7 +6,10 @@
   "fields": [
     {
       "name": "event_id",
-      "type": "string",
+      "type": {
+        "type": "string",
+        "logicalType": "uuid"
+      },
       "doc": "Unique event identifier (UUID). Used as the dedup key across all sinks."
     },
     {

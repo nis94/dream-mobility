@@ -22,8 +22,13 @@ func main() {
 
 	cfg := config.Load()
 
+	// Graceful shutdown on SIGINT/SIGTERM. Created early so producer startup
+	// (SR schema registration with retries) is bounded by the same signal.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// Create Kafka producer (registers schema with SR on startup).
-	prod, err := producer.New(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.SchemaRegistryURL, logger)
+	prod, err := producer.New(ctx, cfg.KafkaBrokers, cfg.KafkaTopic, cfg.SchemaRegistryURL, logger)
 	if err != nil {
 		logger.Error("failed to create producer", "err", err)
 		os.Exit(1)
@@ -52,10 +57,6 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
-
-	// Graceful shutdown on SIGINT/SIGTERM.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	go func() {
 		logger.Info("ingest-api starting", "addr", srv.Addr, "kafka", cfg.KafkaBrokers, "topic", cfg.KafkaTopic)

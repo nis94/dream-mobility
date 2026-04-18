@@ -10,7 +10,7 @@ set -euo pipefail
 
 SR_URL="${SCHEMA_REGISTRY_URL:-http://localhost:8081}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCHEMAS_DIR="${SCRIPT_DIR}/../schemas"
+SCHEMAS_DIR="${SCRIPT_DIR}/../internal/avro"
 
 register() {
   local subject="$1"
