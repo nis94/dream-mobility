@@ -4,10 +4,24 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/segmentio/kafka-go"
 )
+
+// commitTimeout bounds the detached CommitMessages call during shutdown.
+// The request context may already be cancelled; we still want the offset
+// commit RPC to reach the broker so we don't re-deliver the last message.
+const commitTimeout = 5 * time.Second
+
+// fetchBackoff is the minimum pause between consecutive FetchMessage errors.
+// Without it, a broker outage causes a CPU-pinning retry loop and log flood.
+const fetchBackoff = 500 * time.Millisecond
+
+// statsInterval is how often the sampler goroutine emits a structured log
+// line with consumer lag and the decode-failures counter.
+const statsInterval = 30 * time.Second
 
 // Processor reads from Kafka, decodes Avro events, and writes them to Postgres.
 // It uses explicit offset commits (FetchMessage + CommitMessages) so the offset
@@ -17,6 +31,13 @@ type Processor struct {
 	reader *kafka.Reader
 	store  *Store
 	logger *slog.Logger
+
+	// decodeFailures counts messages that could not be parsed as the expected
+	// Avro record (bad magic byte, truncated payload, schema mismatch). These
+	// are committed past — retrying a corrupted message is pointless — so the
+	// counter is the only signal that they occurred. Exposed as read-only in
+	// the sampler log line; writers use atomic.Add.
+	decodeFailures atomic.Uint64
 }
 
 // New creates a Processor. The Kafka reader is configured for manual commit
@@ -27,8 +48,8 @@ func New(brokers []string, topic, groupID string, store *Store, logger *slog.Log
 		Topic:          topic,
 		GroupID:        groupID,
 		MinBytes:       1,
-		MaxBytes:       10 << 20,       // 10 MiB
-		CommitInterval: 0,              // manual commit only
+		MaxBytes:       10 << 20, // 10 MiB
+		CommitInterval: 0,        // manual commit only
 		StartOffset:    kafka.FirstOffset,
 		Logger:         kafkaLogger{logger: logger, level: slog.LevelDebug},
 		ErrorLogger:    kafkaLogger{logger: logger, level: slog.LevelError},
@@ -41,8 +62,16 @@ func New(brokers []string, topic, groupID string, store *Store, logger *slog.Log
 // inserted into Postgres, and its offset committed. Errors on individual
 // messages are logged but do not stop the loop (the message is retried on
 // the next consumer restart because the offset was not committed).
+//
+// A background goroutine samples Kafka reader stats every statsInterval and
+// emits a structured "processor stats" log line with lag and decode-failure
+// count.
 func (p *Processor) Run(ctx context.Context) error {
 	p.logger.Info("processor starting", "topic", p.reader.Config().Topic, "group", p.reader.Config().GroupID)
+
+	samplerCtx, cancelSampler := context.WithCancel(ctx)
+	defer cancelSampler()
+	go p.runStatsSampler(samplerCtx)
 
 	for {
 		msg, err := p.reader.FetchMessage(ctx)
@@ -52,6 +81,14 @@ func (p *Processor) Run(ctx context.Context) error {
 				return nil
 			}
 			p.logger.Error("fetch message failed", "err", err)
+			// Bounded backoff — without this, a broker disconnect becomes a
+			// CPU-pinning retry loop that floods the log. On ctx cancel the
+			// select returns immediately.
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(fetchBackoff):
+			}
 			continue
 		}
 
@@ -62,8 +99,37 @@ func (p *Processor) Run(ctx context.Context) error {
 			continue
 		}
 
-		if err := p.reader.CommitMessages(ctx, msg); err != nil {
+		// Detached context: during graceful shutdown the request ctx is
+		// cancelled before this line runs, so passing it to CommitMessages
+		// would fail the commit and silently guarantee a re-delivery of the
+		// last in-flight message. 5s is well above the normal commit round-trip.
+		commitCtx, cancel := context.WithTimeout(context.Background(), commitTimeout)
+		err = p.reader.CommitMessages(commitCtx, msg)
+		cancel()
+		if err != nil {
 			p.logger.Error("commit offset failed", "partition", msg.Partition, "offset", msg.Offset, "err", err)
+		}
+	}
+}
+
+// runStatsSampler periodically logs consumer lag and the decode-failure
+// counter. Reader.Stats() resets some counters on read, so this MUST be the
+// only goroutine calling it.
+func (p *Processor) runStatsSampler(ctx context.Context) {
+	t := time.NewTicker(statsInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			stats := p.reader.Stats()
+			p.logger.Info("processor stats",
+				"decode_failures", p.decodeFailures.Load(),
+				"lag", stats.Lag,
+				"messages", stats.Messages,
+				"bytes", stats.Bytes,
+			)
 		}
 	}
 }
@@ -71,10 +137,13 @@ func (p *Processor) Run(ctx context.Context) error {
 func (p *Processor) processMessage(ctx context.Context, msg kafka.Message) error {
 	event, err := decodeMovementEvent(msg.Value)
 	if err != nil {
+		p.decodeFailures.Add(1)
 		p.logger.Warn("decode failed, skipping message",
-			"partition", msg.Partition, "offset", msg.Offset, "err", err)
+			"partition", msg.Partition, "offset", msg.Offset,
+			"payload_len", len(msg.Value), "err", err)
 		// Return nil to commit the offset — a corrupted message will never
-		// decode, so retrying is pointless.
+		// decode, so retrying is pointless. The counter lets operators see
+		// that this is happening.
 		return nil
 	}
 
@@ -86,7 +155,8 @@ func (p *Processor) processMessage(ctx context.Context, msg kafka.Message) error
 
 	p.logger.Debug("event processed",
 		"event_id", event.EventID,
-		"entity", event.EntityType+":"+event.EntityID,
+		"entity_type", event.EntityType,
+		"entity_id", event.EntityID,
 		"raw_inserted", result.RawInserted,
 		"position_updated", result.PositionUpdated,
 		"duration", time.Since(start),

@@ -193,23 +193,29 @@ func TestInsertEvent_MultipleEntities(t *testing.T) {
 
 	// 3 raw events.
 	var rawCount int
-	store.pool.QueryRow(ctx, "SELECT count(*) FROM raw_events").Scan(&rawCount)
+	if err := store.pool.QueryRow(ctx, "SELECT count(*) FROM raw_events").Scan(&rawCount); err != nil {
+		t.Fatalf("count raw_events: %v", err)
+	}
 	if rawCount != 3 {
 		t.Errorf("raw_events = %d, want 3", rawCount)
 	}
 
 	// 3 distinct entity positions.
 	var posCount int
-	store.pool.QueryRow(ctx, "SELECT count(*) FROM entity_positions").Scan(&posCount)
+	if err := store.pool.QueryRow(ctx, "SELECT count(*) FROM entity_positions").Scan(&posCount); err != nil {
+		t.Fatalf("count entity_positions: %v", err)
+	}
 	if posCount != 3 {
 		t.Errorf("entity_positions = %d, want 3", posCount)
 	}
 
 	// Verify attributes stored as JSONB.
 	var attrs *string
-	store.pool.QueryRow(ctx, "SELECT attributes::text FROM raw_events WHERE event_id=$1", testUUID(22)).Scan(&attrs)
+	if err := store.pool.QueryRow(ctx, "SELECT attributes::text FROM raw_events WHERE event_id=$1", testUUID(22)).Scan(&attrs); err != nil {
+		t.Fatalf("query attributes: %v", err)
+	}
 	if attrs == nil {
-		t.Fatal("expected non-nil attributes for me-3")
+		t.Fatalf("expected non-nil attributes for event_id=%s", testUUID(22))
 	}
 	if *attrs != `{"battery_level": 0.82}` {
 		t.Errorf("attributes = %q", *attrs)
@@ -258,7 +264,9 @@ func TestInsertEvent_MixedBatch(t *testing.T) {
 
 	// raw_events: 6 unique event_ids (a1,a2,a3,b1,c1,c2) — the duplicate a1 is ignored.
 	var rawCount int
-	store.pool.QueryRow(ctx, "SELECT count(*) FROM raw_events").Scan(&rawCount)
+	if err := store.pool.QueryRow(ctx, "SELECT count(*) FROM raw_events").Scan(&rawCount); err != nil {
+		t.Fatalf("count raw_events: %v", err)
+	}
 	if rawCount != 6 {
 		t.Errorf("raw_events = %d, want 6 (duplicate should be ignored)", rawCount)
 	}

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,26 +16,32 @@ import (
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+	if err := run(logger); err != nil {
+		logger.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
 
+// run wires config, signal-bound context, store, and processor, and blocks on
+// proc.Run. Returning an error here (rather than calling os.Exit from deep in
+// main) guarantees that both store.Close and proc.Close defers fire on every
+// exit path.
+func run(logger *slog.Logger) error {
 	cfg, err := config.Load()
 	if err != nil {
-		logger.Error("failed to load config", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("load config: %w", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Connect to Postgres and run migrations.
 	store, err := processor.NewStore(ctx, cfg.PostgresDSN)
 	if err != nil {
-		logger.Error("failed to connect to postgres", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("connect to postgres: %w", err)
 	}
 	defer store.Close()
 	logger.Info("postgres connected, migrations applied")
 
-	// Start the Kafka consumer loop.
 	proc := processor.New(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroupID, store, logger)
 	defer func() {
 		if err := proc.Close(); err != nil {
@@ -45,11 +53,25 @@ func main() {
 		"brokers", cfg.KafkaBrokers,
 		"topic", cfg.KafkaTopic,
 		"group", cfg.KafkaGroupID,
-		"postgres", cfg.PostgresDSN,
+		"postgres", redactDSN(cfg.PostgresDSN),
 	)
 
 	if err := proc.Run(ctx); err != nil {
-		logger.Error("processor exited with error", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("processor run: %w", err)
 	}
+	return nil
+}
+
+// redactDSN strips the password from a postgres:// DSN so it is safe to emit
+// in startup logs. The username is preserved for debug clarity. Returns
+// "<unparseable>" if the input does not parse as a URL.
+func redactDSN(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparseable>"
+	}
+	if u.User != nil {
+		u.User = url.User(u.User.Username())
+	}
+	return u.String()
 }

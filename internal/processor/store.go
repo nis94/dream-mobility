@@ -42,8 +42,8 @@ func (s *Store) Close() {
 
 // InsertResult describes the outcome of inserting a single event.
 type InsertResult struct {
-	RawInserted      bool // false if duplicate (ON CONFLICT DO NOTHING)
-	PositionUpdated  bool // false if existing position had a newer timestamp
+	RawInserted     bool // false if duplicate (ON CONFLICT DO NOTHING)
+	PositionUpdated bool // false if existing position had a newer timestamp
 }
 
 // InsertEvent atomically inserts the raw event (deduplicated) and upserts
@@ -56,7 +56,10 @@ func (s *Store) InsertEvent(ctx context.Context, ev *avroschema.MovementEvent) (
 	if err != nil {
 		return result, fmt.Errorf("begin tx: %w", err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck // rollback on already-committed tx is a no-op
+	// Use a detached context for rollback: if the request ctx was cancelled
+	// mid-commit, we still want the rollback RPC to reach the server.
+	// Rollback on an already-committed tx is a documented no-op.
+	defer func() { _ = tx.Rollback(context.Background()) }()
 
 	// 1) Raw event insert — dedupe by event_id.
 	tag, err := tx.Exec(ctx, `
