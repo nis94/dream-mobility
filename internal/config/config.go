@@ -7,11 +7,14 @@ import (
 )
 
 // Config holds application configuration, loaded from environment variables.
+// Each service uses the subset of fields it needs; unused fields carry defaults.
 type Config struct {
 	HTTPPort          string
 	KafkaBrokers      []string
 	KafkaTopic        string
+	KafkaGroupID      string
 	SchemaRegistryURL string
+	PostgresDSN       string
 }
 
 // Load reads configuration from environment variables with sensible defaults
@@ -28,7 +31,9 @@ func Load() (Config, error) {
 		HTTPPort:          envOrDefault("HTTP_PORT", "8080"),
 		KafkaBrokers:      brokers,
 		KafkaTopic:        envOrDefault("KAFKA_TOPIC", "movement.events"),
+		KafkaGroupID:      envOrDefault("KAFKA_GROUP_ID", "mobility-postgres"),
 		SchemaRegistryURL: envOrDefault("SCHEMA_REGISTRY_URL", "http://localhost:8081"),
+		PostgresDSN:       envOrDefault("POSTGRES_DSN", "postgres://postgres:postgres@localhost:5432/mobility?sslmode=disable"),
 	}, nil
 }
 
