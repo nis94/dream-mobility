@@ -4,15 +4,20 @@ package processor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	avroschema "github.com/nis94/dream-mobility/internal/avro"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
+
+// PostgreSQL SQLSTATE 23514 = check_violation.
+const pgCheckViolation = "23514"
 
 // testUUID generates a deterministic UUID-shaped string for test data.
 func testUUID(n int) string {
@@ -157,7 +162,7 @@ func TestInsertEvent_OutOfOrder(t *testing.T) {
 	var posLat, posLon float64
 	var lastEventID string
 	err = store.pool.QueryRow(ctx,
-		"SELECT timestamp, lat, lon, last_event_id FROM entity_positions WHERE entity_type='vehicle' AND entity_id='v1'",
+		"SELECT event_ts, lat, lon, last_event_id FROM entity_positions WHERE entity_type='vehicle' AND entity_id='v1'",
 	).Scan(&posTS, &posLat, &posLon, &lastEventID)
 	if err != nil {
 		t.Fatalf("query position: %v", err)
@@ -285,7 +290,7 @@ func assertPosition(t *testing.T, pool *pgxpool.Pool, entityType, entityID strin
 	var lat, lon float64
 	var eid string
 	err := pool.QueryRow(context.Background(),
-		"SELECT timestamp, lat, lon, last_event_id FROM entity_positions WHERE entity_type=$1 AND entity_id=$2",
+		"SELECT event_ts, lat, lon, last_event_id FROM entity_positions WHERE entity_type=$1 AND entity_id=$2",
 		entityType, entityID,
 	).Scan(&ts, &lat, &lon, &eid)
 	if err != nil {
@@ -299,5 +304,48 @@ func assertPosition(t *testing.T, pool *pgxpool.Pool, entityType, entityID strin
 	}
 	if eid != wantEventID {
 		t.Errorf("%s:%s last_event_id = %q, want %q", entityType, entityID, eid, wantEventID)
+	}
+}
+
+// TestInsertEvent_BadCoordinates asserts that the lat/lon CHECK constraints
+// on raw_events reject out-of-range values. This is defense-in-depth against
+// a decoder bug — the handler-side ValidateEvent also enforces these ranges.
+func TestInsertEvent_BadCoordinates(t *testing.T) {
+	store, cleanup := startPostgres(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	ts := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name     string
+		lat, lon float64
+	}{
+		{"lat too high", 91.0, 0.0},
+		{"lat too low", -91.0, 0.0},
+		{"lon too high", 0.0, 181.0},
+		{"lon too low", 0.0, -181.0},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := &avroschema.MovementEvent{
+				EventID:    testUUID(100 + i),
+				EntityType: "vehicle",
+				EntityID:   "bad",
+				Timestamp:  ts,
+				Lat:        tc.lat,
+				Lon:        tc.lon,
+			}
+			_, err := store.InsertEvent(ctx, ev)
+			if err == nil {
+				t.Fatalf("expected CHECK violation for lat=%v lon=%v, got nil", tc.lat, tc.lon)
+			}
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) {
+				t.Fatalf("expected *pgconn.PgError, got %T: %v", err, err)
+			}
+			if pgErr.Code != pgCheckViolation {
+				t.Errorf("SQLSTATE = %q, want %q (check_violation); msg=%s", pgErr.Code, pgCheckViolation, pgErr.Message)
+			}
+		})
 	}
 }
