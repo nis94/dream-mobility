@@ -1,0 +1,24 @@
+[project]
+name = "dream-mobility-archiver"
+version = "0.1.0"
+description = "Kafka → Iceberg/Parquet archiver for the Dream Mobility pipeline."
+requires-python = ">=3.11"
+dependencies = [
+    "confluent-kafka>=2.5.0",
+    "pyiceberg[s3fs]>=0.7.0",
+    "pyarrow>=17.0.0",
+    "fastavro>=1.9.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6.0",
+    "pytest>=8.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "W", "UP", "SIM"]

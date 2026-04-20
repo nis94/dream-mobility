@@ -1,0 +1,18 @@
+[project]
+name = "dream-mobility-lake-query"
+version = "0.1.0"
+description = "Ad-hoc query CLI for the Dream Mobility Iceberg lake."
+requires-python = ">=3.11"
+dependencies = [
+    "pyiceberg[s3fs]>=0.7.0",
+    "duckdb>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
