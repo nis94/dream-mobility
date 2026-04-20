@@ -33,8 +33,6 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	port := cfg.QueryPort()
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -43,7 +41,7 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("connect to postgres: %w", err)
 	}
 	defer store.Close()
-	logger.Info("query-api postgres connected")
+	logger.Info("query-api postgres connected", "postgres", config.RedactDSN(cfg.PostgresDSN))
 
 	h := query.NewHandler(store, logger)
 
@@ -51,7 +49,10 @@ func run(logger *slog.Logger) error {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(30 * time.Second))
+	// Set the per-request timeout slightly below the server's WriteTimeout
+	// so chi produces a clean 503 rather than racing with the server closing
+	// the connection.
+	r.Use(middleware.Timeout(25 * time.Second))
 
 	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -64,7 +65,7 @@ func run(logger *slog.Logger) error {
 	})
 
 	srv := &http.Server{
-		Addr:         ":" + port,
+		Addr:         ":" + cfg.QueryHTTPPort,
 		Handler:      r,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,

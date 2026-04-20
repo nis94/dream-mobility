@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -53,25 +52,11 @@ func run(logger *slog.Logger) error {
 		"brokers", cfg.KafkaBrokers,
 		"topic", cfg.KafkaTopic,
 		"group", cfg.KafkaGroupID,
-		"postgres", redactDSN(cfg.PostgresDSN),
+		"postgres", config.RedactDSN(cfg.PostgresDSN),
 	)
 
 	if err := proc.Run(ctx); err != nil {
 		return fmt.Errorf("processor run: %w", err)
 	}
 	return nil
-}
-
-// redactDSN strips the password from a postgres:// DSN so it is safe to emit
-// in startup logs. The username is preserved for debug clarity. Returns
-// "<unparseable>" if the input does not parse as a URL.
-func redactDSN(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "<unparseable>"
-	}
-	if u.User != nil {
-		u.User = url.User(u.User.Username())
-	}
-	return u.String()
 }

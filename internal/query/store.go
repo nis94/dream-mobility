@@ -2,6 +2,7 @@ package query
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -13,14 +14,63 @@ import (
 // ErrNotFound is returned when the requested entity has no data.
 var ErrNotFound = errors.New("entity not found")
 
+// Pool defaults tuned for a read-only query workload. Heavier on MaxConns
+// than the writer pool because request concurrency dominates, lighter on
+// lifetime because connections rotate naturally under load. Fields are
+// applied only when the DSN did not already set them, so pool_* DSN params
+// still win.
+const (
+	poolMaxConns        = 20
+	poolMinConns        = 2
+	poolMaxConnLifetime = 30 * time.Minute
+	poolMaxConnIdleTime = 5 * time.Minute
+	poolHealthCheck     = 30 * time.Second
+)
+
+// Per-query timeouts. A point read is bounded tight; the paginated listing
+// gets more headroom because large limit values can legitimately need a few
+// hundred ms on cold index pages.
+const (
+	pointReadTimeout = 5 * time.Second
+	listQueryTimeout = 10 * time.Second
+)
+
+// defaultLimit and maxLimit bound the listing page size. The handler validates
+// first and returns HTTP 400 on violation; the store clamps as defense in
+// depth so a direct caller cannot request an unbounded page.
+const (
+	defaultLimit = 100
+	maxLimit     = 1000
+)
+
 // Store provides read-only Postgres queries for the Query API.
 type Store struct {
 	pool *pgxpool.Pool
 }
 
-// NewStore creates a query Store from a DSN.
+// NewStore creates a query Store from a DSN with bounded pool config.
 func NewStore(ctx context.Context, dsn string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse DSN: %w", err)
+	}
+	if cfg.MaxConns == 0 {
+		cfg.MaxConns = poolMaxConns
+	}
+	if cfg.MinConns == 0 {
+		cfg.MinConns = poolMinConns
+	}
+	if cfg.MaxConnLifetime == 0 {
+		cfg.MaxConnLifetime = poolMaxConnLifetime
+	}
+	if cfg.MaxConnIdleTime == 0 {
+		cfg.MaxConnIdleTime = poolMaxConnIdleTime
+	}
+	if cfg.HealthCheckPeriod == 0 {
+		cfg.HealthCheckPeriod = poolHealthCheck
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("pgx pool: %w", err)
 	}
@@ -47,8 +97,13 @@ type Position struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
-// GetPosition returns the last-known position for the given entity.
+// GetPosition returns the last-known position for the given entity. The
+// request context is further bounded by pointReadTimeout to protect against
+// pathological plans.
 func (s *Store) GetPosition(ctx context.Context, entityType, entityID string) (*Position, error) {
+	ctx, cancel := context.WithTimeout(ctx, pointReadTimeout)
+	defer cancel()
+
 	var p Position
 	err := s.pool.QueryRow(ctx, `
 		SELECT entity_type, entity_id, event_ts, lat, lon, last_event_id, updated_at
@@ -65,7 +120,9 @@ func (s *Store) GetPosition(ctx context.Context, entityType, entityID string) (*
 	return &p, nil
 }
 
-// RawEvent is a single row from raw_events.
+// RawEvent is a single row from raw_events. Attributes is opaque JSON bytes —
+// typed as json.RawMessage so the HTTP encoder passes it through as a nested
+// JSON object rather than double-encoding it as a string.
 type RawEvent struct {
 	EventID    string          `json:"event_id"`
 	EntityType string          `json:"entity_type"`
@@ -77,27 +134,41 @@ type RawEvent struct {
 	HeadingDeg *float64        `json:"heading_deg,omitempty"`
 	AccuracyM  *float64        `json:"accuracy_m,omitempty"`
 	Source     *string         `json:"source,omitempty"`
-	Attributes *string         `json:"attributes,omitempty"`
+	Attributes json.RawMessage `json:"attributes,omitempty"`
 	IngestedAt time.Time       `json:"ingested_at"`
 }
 
-// EventsPage is a paginated list of raw events.
+// EventsPage is a paginated list of raw events. NextCursor is the opaque
+// token to pass as the ?cursor= query param to fetch the next page, or
+// empty if this is the last page.
 type EventsPage struct {
 	Events     []RawEvent `json:"events"`
 	NextCursor string     `json:"next_cursor,omitempty"`
 }
 
-// ListEvents returns raw events for the entity, ordered by event_ts DESC,
-// with cursor-based pagination.
+// ListEvents returns raw events for the entity, ordered by (event_ts DESC,
+// event_id DESC). The composite ordering — and the composite cursor — is
+// load-bearing: event_ts alone is not unique, so a strict `event_ts < cursor`
+// predicate would silently drop any sibling rows sharing the boundary
+// microsecond. Row-wise comparison `(event_ts, event_id) < (ts, eid)` with
+// the matching ORDER BY serves every row exactly once.
 //
-// Cursor is the event_ts of the last event on the previous page (RFC3339Nano).
-// An empty cursor starts from the most recent event. Limit caps the page size.
-func (s *Store) ListEvents(ctx context.Context, entityType, entityID string, cursor time.Time, limit int) (*EventsPage, error) {
-	if limit <= 0 || limit > 1000 {
-		limit = 100
+// An empty result is returned as an empty slice (not an error) — we cannot
+// cheaply distinguish "unknown entity" from "known entity with zero events"
+// in a single query, so both collapse to "200 OK, empty list" at the HTTP
+// boundary.
+func (s *Store) ListEvents(ctx context.Context, entityType, entityID string, cursor Cursor, limit int) (*EventsPage, error) {
+	switch {
+	case limit <= 0:
+		limit = defaultLimit
+	case limit > maxLimit:
+		limit = maxLimit
 	}
 
-	// Fetch one extra row to determine if there's a next page.
+	ctx, cancel := context.WithTimeout(ctx, listQueryTimeout)
+	defer cancel()
+
+	// Fetch one extra row to detect whether a next page exists.
 	fetchLimit := limit + 1
 
 	var rows pgx.Rows
@@ -105,22 +176,23 @@ func (s *Store) ListEvents(ctx context.Context, entityType, entityID string, cur
 	if cursor.IsZero() {
 		rows, err = s.pool.Query(ctx, `
 			SELECT event_id, entity_type, entity_id, event_ts, lat, lon,
-			       speed_kmh, heading_deg, accuracy_m, source, attributes::text, ingested_at
+			       speed_kmh, heading_deg, accuracy_m, source, attributes, ingested_at
 			FROM raw_events
 			WHERE entity_type = $1 AND entity_id = $2
-			ORDER BY event_ts DESC
+			ORDER BY event_ts DESC, event_id DESC
 			LIMIT $3`,
 			entityType, entityID, fetchLimit,
 		)
 	} else {
 		rows, err = s.pool.Query(ctx, `
 			SELECT event_id, entity_type, entity_id, event_ts, lat, lon,
-			       speed_kmh, heading_deg, accuracy_m, source, attributes::text, ingested_at
+			       speed_kmh, heading_deg, accuracy_m, source, attributes, ingested_at
 			FROM raw_events
-			WHERE entity_type = $1 AND entity_id = $2 AND event_ts < $3
-			ORDER BY event_ts DESC
-			LIMIT $4`,
-			entityType, entityID, cursor, fetchLimit,
+			WHERE entity_type = $1 AND entity_id = $2
+			  AND (event_ts, event_id) < ($3, $4)
+			ORDER BY event_ts DESC, event_id DESC
+			LIMIT $5`,
+			entityType, entityID, cursor.EventTS, cursor.EventID, fetchLimit,
 		)
 	}
 	if err != nil {
@@ -128,7 +200,7 @@ func (s *Store) ListEvents(ctx context.Context, entityType, entityID string, cur
 	}
 	defer rows.Close()
 
-	var events []RawEvent
+	events := make([]RawEvent, 0, fetchLimit)
 	for rows.Next() {
 		var e RawEvent
 		if err := rows.Scan(
@@ -145,13 +217,10 @@ func (s *Store) ListEvents(ctx context.Context, entityType, entityID string, cur
 	}
 
 	page := &EventsPage{Events: events}
-
-	// If we got the extra row, there's a next page.
 	if len(events) > limit {
 		page.Events = events[:limit]
 		last := events[limit-1]
-		page.NextCursor = last.EventTS.Format(time.RFC3339Nano)
+		page.NextCursor = Cursor{EventTS: last.EventTS, EventID: last.EventID}.Encode()
 	}
-
 	return page, nil
 }

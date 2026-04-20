@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -16,7 +15,7 @@ import (
 // Defined here (consumer side) so tests can supply a fake without a pgx pool.
 type dataStore interface {
 	GetPosition(ctx context.Context, entityType, entityID string) (*Position, error)
-	ListEvents(ctx context.Context, entityType, entityID string, cursor time.Time, limit int) (*EventsPage, error)
+	ListEvents(ctx context.Context, entityType, entityID string, cursor Cursor, limit int) (*EventsPage, error)
 }
 
 // Handler serves the query HTTP endpoints.
@@ -34,59 +33,72 @@ func NewHandler(s dataStore, logger *slog.Logger) *Handler {
 func (h *Handler) GetPosition(w http.ResponseWriter, r *http.Request) {
 	entityType := chi.URLParam(r, "type")
 	entityID := chi.URLParam(r, "id")
+	entityKey := entityType + ":" + entityID
 
 	pos, err := h.store.GetPosition(r.Context(), entityType, entityID)
 	if errors.Is(err, ErrNotFound) {
-		writeJSON(w, http.StatusNotFound, map[string]string{
-			"error": "no position data for " + entityType + ":" + entityID,
+		h.writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": "no position data for " + entityKey,
 		})
 		return
 	}
 	if err != nil {
-		h.logger.Error("get position failed", "entity", entityType+":"+entityID, "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		h.logger.Error("get position failed", "entity", entityKey, "err", err)
+		h.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, pos)
+	h.writeJSON(w, http.StatusOK, pos)
 }
 
 // ListEvents handles GET /entities/{type}/{id}/events?cursor=&limit=.
+//
+// `limit` must parse as an integer in [1, 1000]; malformed or out-of-range
+// values return 400 with a descriptive error. `cursor` must be an opaque
+// token previously returned by the API (base64url composite of event_ts +
+// event_id); malformed cursors return 400.
 func (h *Handler) ListEvents(w http.ResponseWriter, r *http.Request) {
 	entityType := chi.URLParam(r, "type")
 	entityID := chi.URLParam(r, "id")
+	entityKey := entityType + ":" + entityID
 
-	limit := 100
+	limit := defaultLimit
 	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			limit = n
-		}
-	}
-
-	var cursor time.Time
-	if v := r.URL.Query().Get("cursor"); v != "" {
-		t, err := time.Parse(time.RFC3339Nano, v)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "cursor must be RFC3339Nano timestamp",
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 || n > maxLimit {
+			h.writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "limit must be an integer in [1, 1000]",
 			})
 			return
 		}
-		cursor = t
+		limit = n
+	}
+
+	cursor, err := DecodeCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		h.writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "cursor: " + err.Error(),
+		})
+		return
 	}
 
 	page, err := h.store.ListEvents(r.Context(), entityType, entityID, cursor, limit)
 	if err != nil {
-		h.logger.Error("list events failed", "entity", entityType+":"+entityID, "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		h.logger.Error("list events failed", "entity", entityKey, "err", err)
+		h.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, page)
+	h.writeJSON(w, http.StatusOK, page)
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+// writeJSON sets the Content-Type and status, then encodes v. Encode errors
+// after the status has been flushed cannot repair the response but are
+// logged for operability (caller-disconnect mid-write, marshal failure).
+func (h *Handler) writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		h.logger.Warn("response encode failed", "err", err)
+	}
 }

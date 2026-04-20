@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 )
@@ -16,12 +17,6 @@ type Config struct {
 	KafkaGroupID      string
 	SchemaRegistryURL string
 	PostgresDSN       string
-}
-
-// QueryPort returns the HTTP port for the query API. Defaults to QUERY_HTTP_PORT,
-// falling back to 8090 to avoid clashing with the ingest API on 8080.
-func (c Config) QueryPort() string {
-	return c.QueryHTTPPort
 }
 
 // Load reads configuration from environment variables with sensible defaults
@@ -43,6 +38,20 @@ func Load() (Config, error) {
 		SchemaRegistryURL: envOrDefault("SCHEMA_REGISTRY_URL", "http://localhost:8081"),
 		PostgresDSN:       envOrDefault("POSTGRES_DSN", "postgres://postgres:postgres@localhost:5432/mobility?sslmode=disable"),
 	}, nil
+}
+
+// RedactDSN strips the password from a URL-style DSN so it is safe to emit
+// in startup logs. The username is preserved for debug clarity. Returns
+// "<unparseable>" if the input does not parse as a URL.
+func RedactDSN(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparseable>"
+	}
+	if u.User != nil {
+		u.User = url.User(u.User.Username())
+	}
+	return u.String()
 }
 
 // parseBrokers splits a comma-separated list of host:port pairs, trims
