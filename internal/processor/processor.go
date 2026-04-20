@@ -169,6 +169,23 @@ func (p *Processor) Close() error {
 	return p.reader.Close()
 }
 
+// NewReader creates a kafka.Reader with the same configuration used by the
+// Processor. Exported so other consumers (e.g. ClickHouse sink) can reuse
+// the reader setup with a different consumer group.
+func NewReader(brokers []string, topic, groupID string, logger *slog.Logger) *kafka.Reader {
+	return kafka.NewReader(kafka.ReaderConfig{
+		Brokers:        brokers,
+		Topic:          topic,
+		GroupID:        groupID,
+		MinBytes:       1,
+		MaxBytes:       10 << 20,
+		CommitInterval: 0,
+		StartOffset:    kafka.FirstOffset,
+		Logger:         kafkaLogger{logger: logger, level: slog.LevelDebug},
+		ErrorLogger:    kafkaLogger{logger: logger, level: slog.LevelError},
+	})
+}
+
 // kafkaLogger adapts slog to kafka-go's Logger interface.
 type kafkaLogger struct {
 	logger *slog.Logger

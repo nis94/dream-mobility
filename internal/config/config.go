@@ -17,6 +17,8 @@ type Config struct {
 	KafkaGroupID      string
 	SchemaRegistryURL string
 	PostgresDSN       string
+	ClickHouseAddr    string
+	ClickHouseDB      string
 }
 
 // Load reads configuration from environment variables with sensible defaults
@@ -37,6 +39,8 @@ func Load() (Config, error) {
 		KafkaGroupID:      envOrDefault("KAFKA_GROUP_ID", "mobility-postgres"),
 		SchemaRegistryURL: envOrDefault("SCHEMA_REGISTRY_URL", "http://localhost:8081"),
 		PostgresDSN:       envOrDefault("POSTGRES_DSN", "postgres://postgres:postgres@localhost:5432/mobility?sslmode=disable"),
+		ClickHouseAddr:    envOrDefault("CLICKHOUSE_ADDR", "localhost:9000"),
+		ClickHouseDB:      envOrDefault("CLICKHOUSE_DB", "mobility"),
 	}, nil
 }
 
