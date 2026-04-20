@@ -1,0 +1,28 @@
+# Prometheus scrape config for local development.
+# Scrapes Go services' /metrics endpoints exposed on port 9464.
+# In local dev, services run on the host; in k8s, use service discovery.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "ingest-api"
+    static_configs:
+      - targets: ["host.docker.internal:9464"]
+    metrics_path: /metrics
+
+  - job_name: "stream-processor"
+    static_configs:
+      - targets: ["host.docker.internal:9465"]
+    metrics_path: /metrics
+
+  - job_name: "query-api"
+    static_configs:
+      - targets: ["host.docker.internal:9466"]
+    metrics_path: /metrics
+
+  - job_name: "clickhouse-sink"
+    static_configs:
+      - targets: ["host.docker.internal:9467"]
+    metrics_path: /metrics
