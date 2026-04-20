@@ -1,0 +1,21 @@
+replicaCount: 1
+
+image:
+  repository: dream-mobility/clickhouse-sink
+  tag: latest
+  pullPolicy: IfNotPresent
+
+env:
+  KAFKA_BROKERS: "kafka:9092"
+  KAFKA_TOPIC: "movement.events"
+  KAFKA_GROUP_ID: "clickhouse-sink"
+  CLICKHOUSE_ADDR: "clickhouse:9000"
+  CLICKHOUSE_DB: "mobility"
+
+resources:
+  requests:
+    memory: "128Mi"
+    cpu: "100m"
+  limits:
+    memory: "256Mi"
+    cpu: "200m"

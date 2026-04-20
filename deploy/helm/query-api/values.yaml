@@ -1,0 +1,39 @@
+replicaCount: 1
+
+image:
+  repository: dream-mobility/query-api
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8090
+
+containerPort: 8090
+
+env:
+  QUERY_HTTP_PORT: "8090"
+  POSTGRES_DSN: "postgres://postgres:postgres@postgres:5432/mobility?sslmode=disable"
+
+resources:
+  requests:
+    memory: "128Mi"
+    cpu: "100m"
+  limits:
+    memory: "256Mi"
+    cpu: "200m"
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8090
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8090
+  initialDelaySeconds: 3
+  periodSeconds: 5

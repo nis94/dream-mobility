@@ -1,0 +1,6 @@
+apiVersion: v2
+name: stream-processor
+description: Dream Mobility stream processor — consumes Kafka events and upserts into Postgres
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

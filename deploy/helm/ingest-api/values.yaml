@@ -1,0 +1,41 @@
+replicaCount: 1
+
+image:
+  repository: dream-mobility/ingest-api
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+containerPort: 8080
+
+env:
+  HTTP_PORT: "8080"
+  KAFKA_BROKERS: "kafka:9092"
+  KAFKA_TOPIC: "movement.events"
+  SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+
+resources:
+  requests:
+    memory: "128Mi"
+    cpu: "100m"
+  limits:
+    memory: "256Mi"
+    cpu: "200m"
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 3
+  periodSeconds: 5

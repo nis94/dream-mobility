@@ -1,0 +1,20 @@
+replicaCount: 1
+
+image:
+  repository: dream-mobility/stream-processor
+  tag: latest
+  pullPolicy: IfNotPresent
+
+env:
+  KAFKA_BROKERS: "kafka:9092"
+  KAFKA_TOPIC: "movement.events"
+  KAFKA_GROUP_ID: "stream-processor"
+  POSTGRES_DSN: "postgres://postgres:postgres@postgres:5432/mobility?sslmode=disable"
+
+resources:
+  requests:
+    memory: "128Mi"
+    cpu: "100m"
+  limits:
+    memory: "256Mi"
+    cpu: "200m"

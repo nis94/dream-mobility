@@ -1,0 +1,6 @@
+apiVersion: v2
+name: query-api
+description: Dream Mobility query API — serves entity position queries from Postgres
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
