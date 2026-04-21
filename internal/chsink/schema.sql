@@ -71,19 +71,19 @@ FROM mobility.raw_events
 GROUP BY entity_type, entity_id, hour;
 
 -- Read-facing view: merges the aggregate state across unmerged parts and
--- exposes event_count + avg_speed as scalar columns.
+-- exposes event_count + avg_speed_kmh as scalar columns.
 --
 -- sum_speed and speed_count are SimpleAggregateFunction(sum, …) columns,
 -- so we sum() them at read time — grouping on the raw values (as an earlier
 -- revision did) produced pre-merge cardinality and duplicate rows per hour.
+-- Canonical scalars only; callers should not recompute averages from the
+-- intermediate sums. If you need them, query the base table directly.
 CREATE VIEW IF NOT EXISTS mobility.events_hourly_final AS
     SELECT
         entity_type,
         entity_id,
         hour,
         uniqExactMerge(uniq_events) AS event_count,
-        sum(sum_speed)   AS sum_speed,
-        sum(speed_count) AS speed_count,
         CASE WHEN sum(speed_count) > 0
              THEN sum(sum_speed) / sum(speed_count)
              ELSE NULL END AS avg_speed_kmh

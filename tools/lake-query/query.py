@@ -49,8 +49,8 @@ def main() -> None:
     p.add_argument(
         "--timeout",
         type=int,
-        default=30,
-        help="DuckDB statement timeout in seconds (0 = no timeout)",
+        default=0,
+        help="Reserved. DuckDB has no built-in statement timeout; --limit is the real guardrail.",
     )
     args = p.parse_args()
 
@@ -79,10 +79,6 @@ def main() -> None:
     short_name = args.table.split(".")[-1]
     con = duckdb.connect()
     con.register(short_name, arrow_table)
-
-    if args.timeout > 0:
-        # statement_timeout expects milliseconds as a string literal.
-        con.execute(f"SET statement_timeout = '{args.timeout * 1000}ms'")
 
     sql = args.sql
     if args.limit > 0 and "limit" not in sql.lower():
