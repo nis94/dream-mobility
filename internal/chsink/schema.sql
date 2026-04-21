@@ -62,21 +62,30 @@ AS SELECT
     entity_id,
     toStartOfHour(event_ts) AS hour,
     uniqExactState(event_id) AS uniq_events,
-    sumIf(speed_kmh, speed_kmh IS NOT NULL) AS sum_speed,
-    countIf(speed_kmh IS NOT NULL) AS speed_count
+    -- When every row in the block has speed_kmh IS NULL, sum() returns NULL;
+    -- coalesce keeps a 0 flowing into the non-nullable SimpleAggregateFunction.
+    -- sum() / count() on a nullable column already skip NULLs, so no *If needed.
+    toFloat64(coalesce(sum(speed_kmh), 0)) AS sum_speed,
+    toUInt64(count(speed_kmh))             AS speed_count
 FROM mobility.raw_events
 GROUP BY entity_type, entity_id, hour;
 
--- Read-facing view: merges the aggregate state and exposes event_count
--- + avg_speed as scalar columns.
+-- Read-facing view: merges the aggregate state across unmerged parts and
+-- exposes event_count + avg_speed as scalar columns.
+--
+-- sum_speed and speed_count are SimpleAggregateFunction(sum, …) columns,
+-- so we sum() them at read time — grouping on the raw values (as an earlier
+-- revision did) produced pre-merge cardinality and duplicate rows per hour.
 CREATE VIEW IF NOT EXISTS mobility.events_hourly_final AS
     SELECT
         entity_type,
         entity_id,
         hour,
         uniqExactMerge(uniq_events) AS event_count,
-        sum_speed,
-        speed_count,
-        CASE WHEN speed_count > 0 THEN sum_speed / speed_count ELSE NULL END AS avg_speed_kmh
+        sum(sum_speed)   AS sum_speed,
+        sum(speed_count) AS speed_count,
+        CASE WHEN sum(speed_count) > 0
+             THEN sum(sum_speed) / sum(speed_count)
+             ELSE NULL END AS avg_speed_kmh
     FROM mobility.events_hourly
-    GROUP BY entity_type, entity_id, hour, sum_speed, speed_count;
+    GROUP BY entity_type, entity_id, hour;

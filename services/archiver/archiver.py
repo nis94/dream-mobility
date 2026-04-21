@@ -122,13 +122,20 @@ def decode_avro_event(raw: bytes) -> dict[str, Any] | None:
 
 
 def _avro_record_to_dict(rec: dict[str, Any]) -> dict[str, Any]:
-    """Map the Avro record (with timestamp-micros as int) to our flat dict."""
-    # timestamp is microseconds since epoch.
-    ts_micros = rec["timestamp"]
-    event_ts = datetime.fromtimestamp(ts_micros / 1_000_000, tz=UTC)
+    """Map the Avro record to our flat dict. fastavro decodes
+    `timestamp-micros` as a timezone-aware `datetime`, so we take it as-is
+    (older code that divided by 1_000_000 assumed an int and blew up).
+    """
+    # fastavro decodes timestamp-micros as a timezone-aware datetime. The
+    # int-division fallback is defensive for older fastavro versions and
+    # assumes micros-since-epoch if the wire format ever changes.
+    ts = rec["timestamp"]
+    event_ts = ts if isinstance(ts, datetime) else datetime.fromtimestamp(ts / 1_000_000, tz=UTC)
 
+    # fastavro returns uuid.UUID for logicalType=uuid; Arrow expects string.
+    # str() is a no-op on strings so we skip the isinstance branch.
     return {
-        "event_id": rec["event_id"],
+        "event_id": str(rec["event_id"]),
         "entity_type": rec["entity_type"],
         "entity_id": rec["entity_id"],
         "event_ts": event_ts,
@@ -205,10 +212,13 @@ class IcebergArchiver:
             )
             log.info("created iceberg table: %s", self.table_name)
 
-    def add(self, event: dict[str, Any]) -> None:
+    def add(self, event: dict[str, Any]) -> bool:
+        """Append an event. Returns True if the buffer triggered a flush."""
         self.buffer.append(event)
         if len(self.buffer) >= self.flush_size:
             self.flush()
+            return True
+        return False
 
     def should_flush(self) -> bool:
         if not self.buffer:
@@ -265,36 +275,91 @@ def run(args: argparse.Namespace) -> None:
         args.catalog_uri,
     )
 
+    # backoff is only grown/reset in response to error vs successful-message
+    # events, NOT idle polls — resetting on every None would defeat the cap
+    # under a noisy-but-non-fatal broker state that alternates idle / error.
+    backoff = 1.0
     try:
         while running:
-            msg = consumer.poll(timeout=1.0)
+            try:
+                msg = consumer.poll(timeout=1.0)
+            except KafkaException as e:
+                log.error("kafka poll failed, backing off: %s", e)
+                _deadline = time.monotonic() + backoff
+                while running and time.monotonic() < _deadline:
+                    time.sleep(min(0.5, _deadline - time.monotonic()))
+                backoff = min(backoff * 2, 30.0)
+                continue
+
             if msg is None:
                 if archiver.should_flush():
                     archiver.flush()
-                    consumer.commit(asynchronous=False)
+                    _safe_commit(consumer)
                 continue
 
             if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
+                err = msg.error()
+                if err.code() == KafkaError._PARTITION_EOF:
                     continue
-                raise KafkaException(msg.error())
+                if err.fatal():
+                    log.error("fatal kafka error, exiting: %s", err)
+                    running = False
+                    break
+                # Transient — exponential backoff so a persistent-but-
+                # recoverable error doesn't produce one log line per second
+                # indefinitely.
+                log.warning("kafka message error (transient): %s", err)
+                _deadline = time.monotonic() + min(backoff, 30.0)
+                while running and time.monotonic() < _deadline:
+                    time.sleep(min(0.5, _deadline - time.monotonic()))
+                backoff = min(backoff * 2, 30.0)
+                continue
 
             event = decode_avro_event(msg.value())
             if event is not None:
-                had_buffer = len(archiver.buffer) > 0
-                archiver.add(event)
-                # add() may have triggered a size-based flush internally.
-                flushed_by_size = had_buffer and len(archiver.buffer) == 0
-
-                if flushed_by_size or archiver.should_flush():
-                    if not flushed_by_size:
-                        archiver.flush()
-                    consumer.commit(asynchronous=False)
+                # add() returns True when it triggered a size-based flush.
+                flushed = archiver.add(event)
+                if not flushed and archiver.should_flush():
+                    archiver.flush()
+                    flushed = True
+                if flushed:
+                    _safe_commit(consumer)
+            # Successful message path — reset the error backoff.
+            backoff = 1.0
     finally:
-        archiver.flush()
-        consumer.commit(asynchronous=False)
+        final_flush_ok = True
+        try:
+            archiver.flush()
+        except Exception:
+            final_flush_ok = False
+            log.exception(
+                "final flush failed; NOT committing offsets — events will redeliver on restart"
+            )
+        if final_flush_ok:
+            _safe_commit(consumer)
         consumer.close()
         log.info("archiver stopped")
+
+
+def _safe_commit(consumer: Consumer) -> None:
+    """Commit offsets, tolerating:
+      - `_NO_OFFSET` (first commit with nothing processed yet / post-rebalance)
+      - non-`KafkaError` wrappers some older cimpl versions produce
+      - any unexpected exception — downgrade to WARNING so a commit hiccup
+        does not crash the whole archiver.
+    """
+    try:
+        consumer.commit(asynchronous=False)
+    except KafkaException as e:
+        code = None
+        if e.args and isinstance(e.args[0], KafkaError):
+            code = e.args[0].code()
+        if code == KafkaError._NO_OFFSET:
+            log.debug("no offset to commit yet")
+            return
+        log.warning("commit failed (non-fatal): %s", e)
+    except Exception:
+        log.exception("unexpected error during commit")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

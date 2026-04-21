@@ -22,16 +22,16 @@ services:
     container_name: dm-otel-collector
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
     volumes:
-      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
       - "4318:4318"    # OTLP/HTTP receiver
       - "13133:13133"  # health_check extension
     depends_on:
       jaeger:
         condition: service_healthy
-    healthcheck:
-      <<: *hc-defaults
-      test: ["CMD", "wget", "-qO-", "http://localhost:13133/"]
+    # No healthcheck: the otel-collector-contrib image is distroless (no
+    # wget/curl/shell), so any CMD-based probe fails. The collector crash-
+    # loops loudly on a real error, which is the practical signal here.
 
   jaeger:
     image: jaegertracing/all-in-one:1.58
@@ -49,7 +49,7 @@ services:
     image: prom/prometheus:v2.53.0
     container_name: dm-prometheus
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
     extra_hosts:
