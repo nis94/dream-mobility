@@ -82,15 +82,18 @@ k6 run --vus 500 --duration 1m loadtest/ingest.js
 ### 4. Consumer rebalance under load
 
 ```bash
-# Start two processor instances
-go run ./cmd/stream-processor &
+# Both processor instances MUST share the same consumer group — otherwise
+# each instance consumes its own independent copy of the topic and no
+# rebalance happens on kill. The default group id is "mobility-postgres".
+KAFKA_GROUP_ID=mobility-postgres go run ./cmd/stream-processor &
 KAFKA_GROUP_ID=mobility-postgres go run ./cmd/stream-processor &
 
 # Start load, then kill one instance
 k6 run --vus 100 --duration 2m loadtest/ingest.js &
 sleep 30 && kill $(pgrep -f stream-processor | head -1)
 
-# Verify: rebalance completes, no data loss, lag recovers.
+# Verify: rebalance completes, the surviving instance absorbs both
+# partition sets, no data loss, consumer lag recovers.
 ```
 
 ## Verification After Chaos

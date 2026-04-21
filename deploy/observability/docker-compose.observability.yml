@@ -1,21 +1,37 @@
 # Observability stack — run alongside the main docker-compose.yml.
-# Usage: docker compose -f deploy/docker-compose.yml -f deploy/observability/docker-compose.observability.yml up -d
+# Usage:
+#   docker compose -f deploy/docker-compose.yml \
+#                  -f deploy/observability/docker-compose.observability.yml up -d
 #
 # Adds: OTel Collector, Jaeger (trace viewer), Prometheus, Grafana.
+#
+# DEV-ONLY stack. No credentials are protected. Do not expose these ports
+# on any shared network without a reverse proxy + auth in front.
 
 name: dream-mobility
+
+x-healthcheck-defaults: &hc-defaults
+  interval: 10s
+  timeout: 5s
+  retries: 10
+  start_period: 10s
 
 services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.104.0
     container_name: dm-otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
     volumes:
       - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
-      - "4318:4318"   # OTLP/HTTP receiver
+      - "4318:4318"    # OTLP/HTTP receiver
+      - "13133:13133"  # health_check extension
     depends_on:
       jaeger:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "wget", "-qO-", "http://localhost:13133/"]
 
   jaeger:
     image: jaegertracing/all-in-one:1.58
@@ -25,6 +41,9 @@ services:
     ports:
       - "16686:16686"  # Jaeger UI
       - "4317:4317"    # OTLP/gRPC (used by collector)
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "wget", "-qO-", "http://localhost:14269/"]
 
   prometheus:
     image: prom/prometheus:v2.53.0
@@ -35,17 +54,28 @@ services:
       - "9090:9090"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
 
   grafana:
     image: grafana/grafana:11.1.0
     container_name: dm-grafana
     environment:
+      # DEV-ONLY anonymous access with Viewer role. Do NOT promote Admin
+      # — earlier revisions did and that grants dashboard / data-source
+      # mutation to anyone on the LAN with :3000 reachable.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_SECURITY_ADMIN_USER: "admin"
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
     ports:
       - "3000:3000"
     volumes:
       - grafana-data:/var/lib/grafana
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
 
 volumes:
   grafana-data:

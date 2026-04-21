@@ -2,15 +2,19 @@ replicaCount: 1
 
 image:
   repository: dream-mobility/clickhouse-sink
-  tag: latest
+  tag: ""          # defaults to Chart.AppVersion
   pullPolicy: IfNotPresent
 
+metricsPort: 9467
+
 env:
+  PROM_PORT: "9467"
   KAFKA_BROKERS: "kafka:9092"
   KAFKA_TOPIC: "movement.events"
-  KAFKA_GROUP_ID: "clickhouse-sink"
+  KAFKA_GROUP_ID: "mobility-clickhouse"
   CLICKHOUSE_ADDR: "clickhouse:9000"
   CLICKHOUSE_DB: "mobility"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
 
 resources:
   requests:

@@ -15,7 +15,14 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/nis94/dream-mobility/internal/config"
+	otelinit "github.com/nis94/dream-mobility/internal/otel"
 	"github.com/nis94/dream-mobility/internal/query"
+)
+
+const (
+	serviceName     = "query-api"
+	defaultPromPort = "9465"
+	promPortEnv     = "PROM_PORT"
 )
 
 func main() {
@@ -28,6 +35,10 @@ func main() {
 }
 
 func run(logger *slog.Logger) error {
+	if _, set := os.LookupEnv(promPortEnv); !set {
+		_ = os.Setenv(promPortEnv, defaultPromPort)
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -35,6 +46,18 @@ func run(logger *slog.Logger) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	shutdownOtel, err := otelinit.Init(ctx, serviceName, logger)
+	if err != nil {
+		return fmt.Errorf("otel init: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownOtel(shutdownCtx); err != nil {
+			logger.Warn("otel shutdown failed", "err", err)
+		}
+	}()
 
 	store, err := query.NewStore(ctx, cfg.PostgresDSN)
 	if err != nil {

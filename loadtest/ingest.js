@@ -1,7 +1,10 @@
 // k6 load test for the Dream Mobility ingestion API.
 //
-// Ramps from 100 → 10,000 events/sec and validates that the API stays
-// responsive under load with <500ms p99 latency and 0% error rate.
+// Load profile: ramps VUs 50 → 1000 over 5 minutes, each VU POSTs a
+// 10-event batch with a 10ms sleep between iterations. Peak target is
+// ~10k events/sec (~1000 batches/sec) under ideal conditions. Thresholds
+// are calibrated for a beefy dev machine; on a laptop the 1000-VU stage
+// may trip p99 and fail — drop to --vus 200 for initial runs.
 //
 // Usage:
 //   k6 run loadtest/ingest.js

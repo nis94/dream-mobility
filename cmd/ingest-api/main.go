@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,29 +16,56 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/nis94/dream-mobility/internal/api"
 	"github.com/nis94/dream-mobility/internal/config"
+	otelinit "github.com/nis94/dream-mobility/internal/otel"
 	"github.com/nis94/dream-mobility/internal/producer"
+)
+
+const (
+	serviceName       = "ingest-api"
+	defaultPromPort   = "9464"
+	promPortEnv       = "PROM_PORT"
+	shutdownTimeout   = 10 * time.Second
+	otelFlushTimeout  = 5 * time.Second
+	middlewareTimeout = 25 * time.Second
 )
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+	if err := run(logger); err != nil {
+		logger.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run(logger *slog.Logger) error {
+	if _, set := os.LookupEnv(promPortEnv); !set {
+		_ = os.Setenv(promPortEnv, defaultPromPort)
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
-		logger.Error("failed to load config", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("load config: %w", err)
 	}
 
-	// Graceful shutdown on SIGINT/SIGTERM. Created early so producer startup
-	// (SR schema registration with retries) is bounded by the same signal.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Create Kafka producer (registers schema with SR on startup).
+	shutdownOtel, err := otelinit.Init(ctx, serviceName, logger)
+	if err != nil {
+		return fmt.Errorf("otel init: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), otelFlushTimeout)
+		defer cancel()
+		if err := shutdownOtel(shutdownCtx); err != nil {
+			logger.Warn("otel shutdown failed", "err", err)
+		}
+	}()
+
 	prod, err := producer.New(ctx, cfg.KafkaBrokers, cfg.KafkaTopic, cfg.SchemaRegistryURL, logger)
 	if err != nil {
-		logger.Error("failed to create producer", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("create producer: %w", err)
 	}
 	defer func() {
 		if err := prod.Close(); err != nil {
@@ -51,7 +79,7 @@ func main() {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(30 * time.Second))
+	r.Use(middleware.Timeout(middlewareTimeout))
 
 	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -67,8 +95,6 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// The server goroutine reports only unexpected errors via srvErr.
-	// http.ErrServerClosed is the normal return from Shutdown and is filtered.
 	srvErr := make(chan error, 1)
 	go func() {
 		logger.Info("ingest-api starting", "addr", srv.Addr, "kafka", cfg.KafkaBrokers, "topic", cfg.KafkaTopic)
@@ -82,12 +108,13 @@ func main() {
 	case <-ctx.Done():
 		logger.Info("shutting down", "signal", ctx.Err())
 	case err := <-srvErr:
-		logger.Error("http server error", "err", err)
+		return fmt.Errorf("http server: %w", err)
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("http shutdown error", "err", err)
+		return fmt.Errorf("http shutdown: %w", err)
 	}
+	return nil
 }

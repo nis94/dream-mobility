@@ -2,14 +2,24 @@ replicaCount: 1
 
 image:
   repository: dream-mobility/stream-processor
-  tag: latest
+  tag: ""          # defaults to Chart.AppVersion
   pullPolicy: IfNotPresent
 
+metricsPort: 9466
+
 env:
+  PROM_PORT: "9466"
   KAFKA_BROKERS: "kafka:9092"
   KAFKA_TOPIC: "movement.events"
-  KAFKA_GROUP_ID: "stream-processor"
+  KAFKA_GROUP_ID: "mobility-postgres"
+  # DEV-ONLY dsn. In production set postgresSecret below and leave
+  # POSTGRES_DSN unset so the chart reads from the Secret.
   POSTGRES_DSN: "postgres://postgres:postgres@postgres:5432/mobility?sslmode=disable"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+
+# postgresSecret:
+#   name: dm-postgres-dsn
+#   key: dsn
 
 resources:
   requests:

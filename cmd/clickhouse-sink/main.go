@@ -1,20 +1,46 @@
+// Command clickhouse-sink consumes movement.events from Kafka and batches
+// writes into ClickHouse. The consumer loop owns the batch buffer, the
+// flush timer, AND the Kafka offset commit — so a batch's offset is only
+// committed AFTER the ClickHouse INSERT succeeds, preserving at-least-once
+// with zero data loss under the Phase 5 audit contract.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/nis94/dream-mobility/internal/chsink"
 	"github.com/nis94/dream-mobility/internal/config"
+	otelinit "github.com/nis94/dream-mobility/internal/otel"
 	"github.com/nis94/dream-mobility/internal/processor"
+	"github.com/segmentio/kafka-go"
 )
 
-const fetchBackoff = 500 * time.Millisecond
+// Tuning knobs. Overridable via env (CLICKHOUSE_BATCH_SIZE,
+// CLICKHOUSE_BATCH_TIMEOUT, CLICKHOUSE_BUFFER_MAX) so deploys can tune
+// without a code change.
+var (
+	fetchBackoff   = 500 * time.Millisecond
+	commitTimeout  = 5 * time.Second
+	statsInterval  = 30 * time.Second
+	flushOnClose   = 10 * time.Second
+	serviceName    = "clickhouse-sink"
+	defaultGroupID = "mobility-clickhouse"
+)
+
+const (
+	defaultPromPort = "9467"
+	promPortEnv     = "PROM_PORT"
+)
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -26,6 +52,10 @@ func main() {
 }
 
 func run(logger *slog.Logger) error {
+	if _, set := os.LookupEnv(promPortEnv); !set {
+		_ = os.Setenv(promPortEnv, defaultPromPort)
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -34,79 +64,257 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Connect to ClickHouse and run migrations.
-	sink, err := chsink.New(ctx, cfg.ClickHouseAddr, cfg.ClickHouseDB, logger)
+	shutdownOtel, err := otelinit.Init(ctx, serviceName, logger)
+	if err != nil {
+		return fmt.Errorf("otel init: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownOtel(shutdownCtx); err != nil {
+			logger.Warn("otel shutdown failed", "err", err)
+		}
+	}()
+
+	batchSize := envInt("CLICKHOUSE_BATCH_SIZE", chsink.DefaultBatchSize)
+	batchTimeout := envDuration("CLICKHOUSE_BATCH_TIMEOUT", chsink.DefaultBatchTimeout)
+	bufferMax := envInt("CLICKHOUSE_BUFFER_MAX", batchSize*4)
+
+	sink, err := chsink.New(ctx, chsink.Config{
+		Addr:         cfg.ClickHouseAddr,
+		Database:     cfg.ClickHouseDB,
+		BatchSize:    batchSize,
+		BatchTimeout: batchTimeout,
+	}, logger)
 	if err != nil {
 		return fmt.Errorf("clickhouse sink: %w", err)
 	}
 	defer func() {
-		if err := sink.Close(context.Background()); err != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), flushOnClose)
+		defer cancel()
+		if err := sink.Close(shutdownCtx); err != nil {
 			logger.Error("clickhouse close failed", "err", err)
 		}
 	}()
 
-	// Start the periodic flusher in background.
-	go sink.RunFlusher(ctx)
-
-	// Reuse the processor's decode logic — we consume the same topic with
-	// a different consumer group so each sink gets its own copy of the stream.
-	groupID := cfg.KafkaGroupID + "-clickhouse"
+	groupID := cfg.KafkaGroupID
+	if groupID == "" || groupID == "mobility-postgres" {
+		// If the user didn't override, fall back to the sink's own default
+		// rather than inheriting the Postgres group id by accident.
+		groupID = defaultGroupID
+	}
 
 	logger.Info("clickhouse-sink starting",
 		"brokers", cfg.KafkaBrokers,
 		"topic", cfg.KafkaTopic,
 		"group", groupID,
 		"clickhouse", cfg.ClickHouseAddr,
+		"batch_size", batchSize,
+		"batch_timeout", batchTimeout,
+		"buffer_max", bufferMax,
 	)
 
-	return consumeLoop(ctx, cfg, groupID, sink, logger)
+	return consumeLoop(ctx, cfg, groupID, sink, logger, consumeOpts{
+		batchSize:    batchSize,
+		batchTimeout: batchTimeout,
+		bufferMax:    bufferMax,
+	})
 }
 
-// consumeLoop reads from Kafka, decodes events, and adds them to the
-// ClickHouse sink. It mirrors the processor's consume pattern but without
-// the Postgres store.
-func consumeLoop(ctx context.Context, cfg config.Config, groupID string, sink *chsink.Sink, logger *slog.Logger) error {
-	// Create a lightweight consumer using the processor package's Kafka reader
-	// config pattern. We only need the decode function from processor.
+type consumeOpts struct {
+	batchSize    int
+	batchTimeout time.Duration
+	bufferMax    int
+}
+
+// consumeLoop is single-goroutine. A helper goroutine fetches from Kafka
+// and pipes messages into msgCh so the main select can race timer vs
+// shutdown vs new-message. The main goroutine owns the buffer + sink and
+// commits offsets only after sink.Flush() succeeds.
+func consumeLoop(
+	ctx context.Context,
+	cfg config.Config,
+	groupID string,
+	sink *chsink.Sink,
+	logger *slog.Logger,
+	opts consumeOpts,
+) error {
 	reader := processor.NewReader(cfg.KafkaBrokers, cfg.KafkaTopic, groupID, logger)
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
+
+	var decodeFailures atomic.Uint64
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go runStatsSampler(ctx, &wg, reader, &decodeFailures, logger)
+
+	msgCh := make(chan kafka.Message, opts.batchSize)
+	errCh := make(chan error, 1)
+	wg.Add(1)
+	go runFetcher(ctx, &wg, reader, msgCh, errCh, logger)
+	defer wg.Wait()
+
+	buffered := make([]kafka.Message, 0, opts.batchSize)
+	ticker := time.NewTicker(opts.batchTimeout)
+	defer ticker.Stop()
+
+	flushAndCommit := func() error {
+		if len(buffered) == 0 {
+			return nil
+		}
+		if err := sink.Flush(ctx); err != nil {
+			return fmt.Errorf("flush: %w", err)
+		}
+		commitCtx, cancel := context.WithTimeout(context.Background(), commitTimeout)
+		err := reader.CommitMessages(commitCtx, buffered...)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("commit offsets: %w", err)
+		}
+		buffered = buffered[:0]
+		return nil
+	}
 
 	for {
-		msg, err := reader.FetchMessage(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				logger.Info("clickhouse-sink stopped (context cancelled)")
-				return nil
-			}
+		// Backpressure: when the buffer is full, pause fetching by selecting
+		// on a nil channel (which blocks forever) instead of msgCh.
+		var msgCase <-chan kafka.Message = msgCh
+		if len(buffered) >= opts.bufferMax {
+			msgCase = nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return drainAndExit(reader, sink, buffered, logger)
+
+		case err := <-errCh:
 			logger.Error("fetch message failed", "err", err)
 			select {
 			case <-ctx.Done():
-				return nil
+				return drainAndExit(reader, sink, buffered, logger)
 			case <-time.After(fetchBackoff):
 			}
 			continue
-		}
 
-		event, err := processor.DecodeMovementEvent(msg.Value)
-		if err != nil {
-			logger.Warn("decode failed, skipping", "offset", msg.Offset, "err", err)
-			commitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := reader.CommitMessages(commitCtx, msg); err != nil {
-				logger.Error("commit past corrupted message failed", "offset", msg.Offset, "err", err)
+		case <-ticker.C:
+			if err := flushAndCommit(); err != nil {
+				logger.Error("periodic flush failed", "err", err)
 			}
-			cancel()
-			continue
-		}
 
-		if err := sink.Add(ctx, event); err != nil {
-			logger.Error("clickhouse add failed", "event_id", event.EventID, "err", err)
-			continue
-		}
+		case msg := <-msgCase:
+			event, err := processor.DecodeMovementEvent(msg.Value)
+			if err != nil {
+				decodeFailures.Add(1)
+				logger.Warn("decode failed, skipping",
+					"partition", msg.Partition, "offset", msg.Offset,
+					"payload_len", len(msg.Value), "err", err)
+				// Flush any pending batch BEFORE committing past the poison
+				// message, otherwise CommitMessages(msg) would skip the
+				// un-committed buffered offsets for the same partition.
+				if err := flushAndCommit(); err != nil {
+					logger.Error("flush before poison commit failed", "err", err)
+					continue
+				}
+				commitCtx, cancel := context.WithTimeout(context.Background(), commitTimeout)
+				if err := reader.CommitMessages(commitCtx, msg); err != nil {
+					logger.Error("commit past poison failed", "offset", msg.Offset, "err", err)
+				}
+				cancel()
+				continue
+			}
 
-		commitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := reader.CommitMessages(commitCtx, msg); err != nil {
-			logger.Error("commit offset failed", "offset", msg.Offset, "err", err)
+			sink.Add(ctx, event)
+			buffered = append(buffered, msg)
+			if len(buffered) >= opts.batchSize {
+				if err := flushAndCommit(); err != nil {
+					logger.Error("size-triggered flush failed", "err", err)
+				}
+			}
 		}
-		cancel()
 	}
+}
+
+// drainAndExit attempts a final flush + commit on shutdown using a detached
+// context so the in-flight batch is not lost to signal cancellation.
+func drainAndExit(reader *kafka.Reader, sink *chsink.Sink, buffered []kafka.Message, logger *slog.Logger) error {
+	if len(buffered) == 0 {
+		logger.Info("clickhouse-sink stopped (context cancelled)")
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), flushOnClose)
+	defer cancel()
+	if err := sink.Flush(ctx); err != nil {
+		logger.Error("shutdown flush failed — events will redeliver from Kafka", "err", err)
+		return nil
+	}
+	if err := reader.CommitMessages(ctx, buffered...); err != nil {
+		logger.Error("shutdown commit failed — events will redeliver from Kafka", "err", err)
+		return nil
+	}
+	logger.Info("clickhouse-sink stopped cleanly", "final_batch", len(buffered))
+	return nil
+}
+
+func runFetcher(ctx context.Context, wg *sync.WaitGroup, reader *kafka.Reader, msgCh chan<- kafka.Message, errCh chan<- error, logger *slog.Logger) {
+	defer wg.Done()
+	for {
+		msg, err := reader.FetchMessage(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+				logger.Info("fetcher stopped (context cancelled)")
+				return
+			}
+			// Non-blocking send: if the consumer is busy flushing we prefer
+			// to drop-into-retry rather than block the fetcher goroutine.
+			select {
+			case errCh <- err:
+			case <-ctx.Done():
+				return
+			}
+			return
+		}
+		select {
+		case msgCh <- msg:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func runStatsSampler(ctx context.Context, wg *sync.WaitGroup, reader *kafka.Reader, decodeFailures *atomic.Uint64, logger *slog.Logger) {
+	defer wg.Done()
+	t := time.NewTicker(statsInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			stats := reader.Stats()
+			logger.Info("clickhouse-sink stats",
+				"decode_failures", decodeFailures.Load(),
+				"lag", stats.Lag,
+				"messages", stats.Messages,
+				"bytes", stats.Bytes,
+			)
+		}
+	}
+}
+
+func envInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return fallback
 }

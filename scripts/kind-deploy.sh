@@ -41,5 +41,6 @@ done
 
 echo ""
 echo "==> All services deployed. Checking pod status..."
-kubectl get pods -l release=dm-ingest-api -l release=dm-stream-processor -l release=dm-query-api -l release=dm-clickhouse-sink 2>/dev/null || true
-kubectl get pods
+# Use an `in (...)` set selector — multiple -l flags AND together, which
+# selects no pods because no pod has all four release labels.
+kubectl get pods -l 'release in (dm-ingest-api,dm-stream-processor,dm-query-api,dm-clickhouse-sink)' 2>/dev/null || kubectl get pods

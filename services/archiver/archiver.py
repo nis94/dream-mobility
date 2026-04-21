@@ -24,6 +24,7 @@ Environment variables (override CLI defaults):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -36,11 +37,12 @@ from typing import Any
 import pyarrow as pa
 from confluent_kafka import Consumer, KafkaError, KafkaException
 from pyiceberg.catalog import load_catalog
-from pyiceberg.exceptions import NoSuchTableError
+from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
+from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
+from pyiceberg.transforms import DayTransform, IdentityTransform
 from pyiceberg.types import (
     DoubleType,
-    LongType,
     NestedField,
     StringType,
     TimestamptzType,
@@ -108,8 +110,9 @@ def decode_avro_event(raw: bytes) -> dict[str, Any] | None:
         return None
 
     try:
-        import fastavro
         import io as _io
+
+        import fastavro
 
         rec = fastavro.schemaless_reader(_io.BytesIO(raw[5:]), _get_avro_schema())
         return _avro_record_to_dict(rec)
@@ -153,6 +156,7 @@ class IcebergArchiver:
         table_name: str = "mobility.raw_events",
         flush_size: int = 10000,
         flush_interval: float = 30.0,
+        catalog_token: str | None = None,
     ):
         self.flush_size = flush_size
         self.flush_interval = flush_interval
@@ -160,35 +164,32 @@ class IcebergArchiver:
         self.buffer: list[dict[str, Any]] = []
         self.last_flush = time.monotonic()
 
-        # Configure the Iceberg catalog.
-        self.catalog = load_catalog(
-            "rest",
-            **{
-                "uri": catalog_uri,
-                "s3.endpoint": s3_endpoint,
-                "s3.access-key-id": s3_access_key,
-                "s3.secret-access-key": s3_secret_key,
-                "warehouse": warehouse,
-            },
-        )
+        # Configure the Iceberg catalog. The REST catalog supports an
+        # optional bearer token — without it the catalog is effectively
+        # unauthenticated, which is fine for the dev image but unsafe for
+        # any non-local deployment.
+        catalog_kwargs: dict[str, Any] = {
+            "uri": catalog_uri,
+            "s3.endpoint": s3_endpoint,
+            "s3.access-key-id": s3_access_key,
+            "s3.secret-access-key": s3_secret_key,
+            "warehouse": warehouse,
+        }
+        if catalog_token:
+            catalog_kwargs["token"] = catalog_token
+        self.catalog = load_catalog("rest", **catalog_kwargs)
 
-        # Ensure the table exists.
         self._ensure_table()
 
     def _ensure_table(self) -> None:
-        namespace, name = self.table_name.split(".", 1)
-        try:
+        namespace, _name = self.table_name.split(".", 1)
+        with contextlib.suppress(NamespaceAlreadyExistsError):
             self.catalog.create_namespace(namespace)
-        except Exception:
-            pass  # Already exists.
 
         try:
             self.table = self.catalog.load_table(self.table_name)
             log.info("loaded existing iceberg table: %s", self.table_name)
         except NoSuchTableError:
-            from pyiceberg.partitioning import PartitionField, PartitionSpec
-            from pyiceberg.transforms import DayTransform, IdentityTransform
-
             partition_spec = PartitionSpec(
                 PartitionField(
                     source_id=4, field_id=1000, transform=DayTransform(), name="event_day"
@@ -234,6 +235,7 @@ def run(args: argparse.Namespace) -> None:
         s3_endpoint=args.s3_endpoint,
         s3_access_key=args.s3_access_key,
         s3_secret_key=args.s3_secret_key,
+        catalog_token=args.catalog_token,
         flush_size=args.flush_size,
         flush_interval=args.flush_interval,
     )
@@ -303,8 +305,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--catalog-uri", default=os.getenv("ICEBERG_CATALOG_URI", "http://localhost:8181"))
     p.add_argument("--warehouse", default=os.getenv("ICEBERG_WAREHOUSE", "s3://lake/"))
     p.add_argument("--s3-endpoint", default=os.getenv("S3_ENDPOINT", "http://localhost:9100"))
-    p.add_argument("--s3-access-key", default=os.getenv("S3_ACCESS_KEY", "minioadmin"))
-    p.add_argument("--s3-secret-key", default=os.getenv("S3_SECRET_KEY", "minioadmin"))
+    # S3 credentials must be supplied via env or flag — no hardcoded default
+    # so a real deployment cannot accidentally ship with minioadmin/minioadmin.
+    p.add_argument("--s3-access-key", default=os.getenv("S3_ACCESS_KEY"))
+    p.add_argument("--s3-secret-key", default=os.getenv("S3_SECRET_KEY"))
+    p.add_argument(
+        "--catalog-token",
+        default=os.getenv("ICEBERG_CATALOG_TOKEN"),
+        help="Optional bearer token for the Iceberg REST catalog",
+    )
     p.add_argument("--flush-size", type=int, default=10000)
     p.add_argument("--flush-interval", type=float, default=30.0)
     return p.parse_args(argv)
@@ -317,6 +326,12 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stderr,
     )
+    if not args.s3_access_key or not args.s3_secret_key:
+        log.error(
+            "S3 credentials are required; set S3_ACCESS_KEY / S3_SECRET_KEY "
+            "or pass --s3-access-key / --s3-secret-key (use minioadmin for local dev)"
+        )
+        sys.exit(2)
     run(args)
 
 

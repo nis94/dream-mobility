@@ -2,21 +2,25 @@ replicaCount: 1
 
 image:
   repository: dream-mobility/ingest-api
-  tag: latest
+  # tag defaults to Chart.AppVersion when unset — keeps image + chart in lockstep.
+  tag: ""
   pullPolicy: IfNotPresent
 
 service:
   type: ClusterIP
-  port: 80
+  port: 8080
   targetPort: 8080
 
 containerPort: 8080
+metricsPort: 9464
 
 env:
   HTTP_PORT: "8080"
+  PROM_PORT: "9464"
   KAFKA_BROKERS: "kafka:9092"
   KAFKA_TOPIC: "movement.events"
   SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
 
 resources:
   requests:

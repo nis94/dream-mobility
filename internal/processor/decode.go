@@ -8,6 +8,12 @@ import (
 	avroschema "github.com/nis94/dream-mobility/internal/avro"
 )
 
+// DecodeMovementEvent is the exported entry point for other consumers
+// (e.g. the ClickHouse sink) that share the same Kafka topic.
+func DecodeMovementEvent(data []byte) (*avroschema.MovementEvent, error) {
+	return decodeMovementEvent(data)
+}
+
 // decodeMovementEvent strips the Confluent Schema Registry wire format
 // (magic byte + 4-byte schema ID) and deserializes the Avro payload.
 //
@@ -17,12 +23,6 @@ import (
 //	bytes 1-4: schema ID (big-endian uint32) — ignored here; we trust the
 //	           topic-level subject binding.
 //	bytes 5+:  Avro binary data
-// DecodeMovementEvent is the exported entry point for other consumers
-// (e.g. the ClickHouse sink) that share the same Kafka topic.
-func DecodeMovementEvent(data []byte) (*avroschema.MovementEvent, error) {
-	return decodeMovementEvent(data)
-}
-
 func decodeMovementEvent(data []byte) (*avroschema.MovementEvent, error) {
 	if len(data) < 6 { // 5-byte header + at least 1 byte payload
 		return nil, fmt.Errorf("message too short (%d bytes)", len(data))

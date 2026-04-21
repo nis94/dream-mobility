@@ -2,19 +2,32 @@ replicaCount: 1
 
 image:
   repository: dream-mobility/query-api
-  tag: latest
+  tag: ""          # defaults to Chart.AppVersion
   pullPolicy: IfNotPresent
 
 service:
   type: ClusterIP
-  port: 80
+  port: 8090
   targetPort: 8090
 
 containerPort: 8090
+metricsPort: 9465
 
 env:
   QUERY_HTTP_PORT: "8090"
+  PROM_PORT: "9465"
+  # DEV-ONLY dsn for a kind cluster with the bundled Postgres. For any real
+  # deployment, DO NOT ship credentials in values.yaml. Instead, set
+  # `postgresSecret.name` below (and leave this POSTGRES_DSN blank) so the
+  # deployment pulls the DSN from a Kubernetes Secret via valueFrom.
   POSTGRES_DSN: "postgres://postgres:postgres@postgres:5432/mobility?sslmode=disable"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+
+# Production override — uncomment to pull the DSN from a Secret.
+# When set, the template ignores the inline POSTGRES_DSN above.
+# postgresSecret:
+#   name: dm-postgres-dsn
+#   key: dsn
 
 resources:
   requests:

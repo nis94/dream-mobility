@@ -1,3 +1,12 @@
+// Package chsink batches MovementEvent records and writes them to
+// ClickHouse via the native protocol.
+//
+// Correctness contract (Phase 5 audit fix): the Sink is a pure buffer + batch
+// writer. It does NOT own the Kafka reader, does NOT own a background
+// goroutine, and does NOT commit offsets. The consumer loop drives every
+// flush and commits offsets AFTER the batch write succeeds — so a crash
+// between Add() and Flush() loses no data (those events' Kafka offsets
+// were never committed and redelivery will replay them).
 package chsink
 
 import (
@@ -17,33 +26,69 @@ import (
 //go:embed schema.sql
 var migrationSQL string
 
-const (
-	// batchSize is the max events accumulated before a flush.
-	batchSize = 5000
-	// batchTimeout is the max duration before an incomplete batch is flushed.
-	batchTimeout = 2 * time.Second
-)
+// DefaultBatchSize is the default number of events accumulated before a
+// forced flush. Exposed so the consumer loop can align its batch-commit
+// trigger with the sink's buffer bound.
+const DefaultBatchSize = 5000
 
-// Sink batches movement events and writes them to ClickHouse via the native
-// protocol. Events are accumulated in memory and flushed either when
-// batchSize is reached or batchTimeout elapses, whichever comes first.
-type Sink struct {
-	conn   driver.Conn
-	logger *slog.Logger
+// DefaultBatchTimeout is the default max duration an incomplete batch
+// may sit in the buffer before being flushed.
+const DefaultBatchTimeout = 2 * time.Second
 
-	mu    sync.Mutex
-	buf   []*avroschema.MovementEvent
-	timer *time.Timer
+// Config bounds the sink's buffer and write behavior. Zero values fall back
+// to the Default* constants.
+type Config struct {
+	Addr         string
+	Database     string
+	BatchSize    int
+	BatchTimeout time.Duration
 }
 
-// New connects to ClickHouse and runs migrations. The addr should be the
-// native-protocol endpoint (e.g. "localhost:9000").
-func New(ctx context.Context, addr, database string, logger *slog.Logger) (*Sink, error) {
+// Sink batches movement events and writes them to ClickHouse via the native
+// protocol. Safe for serial Add/Flush/Close from a single goroutine; the
+// internal mutex only guards against Close racing a still-in-flight Flush.
+type Sink struct {
+	conn      driver.Conn
+	logger    *slog.Logger
+	batchSize int
+
+	mu  sync.Mutex
+	buf []*avroschema.MovementEvent
+}
+
+// New connects to ClickHouse, applies the embedded migration, and returns
+// a Sink ready for use.
+//
+// Bootstraps in two steps: a short-lived connection without Auth.Database
+// runs the `CREATE DATABASE IF NOT EXISTS` (so the target DB exists before
+// the main connection selects it), then a second connection bound to the
+// target DB runs the table + MV DDL. This avoids the chicken-and-egg where
+// Ping() on Auth.Database would fail before CREATE DATABASE had a chance
+// to run.
+func New(ctx context.Context, cfg Config, logger *slog.Logger) (*Sink, error) {
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = DefaultBatchSize
+	}
+	bootstrap, err := clickhouse.Open(&clickhouse.Options{
+		Addr:        []string{cfg.Addr},
+		DialTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("clickhouse bootstrap open: %w", err)
+	}
+	if err := bootstrap.Ping(ctx); err != nil {
+		_ = bootstrap.Close()
+		return nil, fmt.Errorf("clickhouse ping: %w", err)
+	}
+	if err := bootstrap.Exec(ctx, "CREATE DATABASE IF NOT EXISTS "+cfg.Database); err != nil {
+		_ = bootstrap.Close()
+		return nil, fmt.Errorf("clickhouse create database: %w", err)
+	}
+	_ = bootstrap.Close()
+
 	conn, err := clickhouse.Open(&clickhouse.Options{
-		Addr: []string{addr},
-		Auth: clickhouse.Auth{
-			Database: database,
-		},
+		Addr:         []string{cfg.Addr},
+		Auth:         clickhouse.Auth{Database: cfg.Database},
 		MaxOpenConns: 5,
 		MaxIdleConns: 2,
 		DialTimeout:  5 * time.Second,
@@ -51,84 +96,78 @@ func New(ctx context.Context, addr, database string, logger *slog.Logger) (*Sink
 	if err != nil {
 		return nil, fmt.Errorf("clickhouse open: %w", err)
 	}
-	if err := conn.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("clickhouse ping: %w", err)
-	}
 
-	// Run migrations (CREATE IF NOT EXISTS is idempotent).
-	// ClickHouse driver executes one statement per Exec call, so we split
-	// the migration file on semicolons.
 	if err := execStatements(ctx, conn, migrationSQL); err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("clickhouse migrate: %w", err)
 	}
-	logger.Info("clickhouse connected, migrations applied", "addr", addr, "db", database)
+	logger.Info("clickhouse ready", "addr", cfg.Addr, "db", cfg.Database)
 
-	s := &Sink{
-		conn:   conn,
-		logger: logger,
-		buf:    make([]*avroschema.MovementEvent, 0, batchSize),
-	}
-	s.resetTimer()
-	return s, nil
+	return &Sink{
+		conn:      conn,
+		logger:    logger,
+		batchSize: cfg.BatchSize,
+		buf:       make([]*avroschema.MovementEvent, 0, cfg.BatchSize),
+	}, nil
 }
 
-// Add enqueues an event for batched insertion. If the batch reaches batchSize,
-// it is flushed synchronously.
-func (s *Sink) Add(ctx context.Context, event *avroschema.MovementEvent) error {
+// Add appends an event to the in-memory buffer. Unlike the previous design,
+// Add never triggers a flush on its own — the caller decides when to Flush
+// (after hitting batchSize, on a timer, or on shutdown). This keeps flushing
+// serialized with Kafka offset commits.
+func (s *Sink) Add(_ context.Context, event *avroschema.MovementEvent) {
 	s.mu.Lock()
 	s.buf = append(s.buf, event)
-	needFlush := len(s.buf) >= batchSize
 	s.mu.Unlock()
-
-	if needFlush {
-		return s.Flush(ctx)
-	}
-	return nil
 }
 
-// Flush writes the current buffer to ClickHouse in a single batch INSERT.
+// Len returns the current buffer length. Used by the consumer loop to decide
+// when to trigger a size-based flush.
+func (s *Sink) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.buf)
+}
+
+// Flush writes every buffered event to ClickHouse in a single batch INSERT.
+// On success the buffer is cleared and nil is returned, so the caller may
+// commit the corresponding Kafka offsets. On failure the buffer is left
+// intact so the next Flush will retry the same events — and because offsets
+// were not committed, a crash here replays from Kafka with no data loss.
 func (s *Sink) Flush(ctx context.Context) error {
 	s.mu.Lock()
-	if len(s.buf) == 0 {
+	n := len(s.buf)
+	if n == 0 {
 		s.mu.Unlock()
 		return nil
 	}
 	batch := s.buf
-	s.buf = make([]*avroschema.MovementEvent, 0, batchSize)
-	s.resetTimerLocked()
 	s.mu.Unlock()
 
 	if err := s.writeBatch(ctx, batch); err != nil {
-		// Re-enqueue failed batch for retry on next flush.
-		s.mu.Lock()
-		s.buf = append(batch, s.buf...)
-		s.mu.Unlock()
 		return err
 	}
 
-	s.logger.Debug("clickhouse batch flushed", "count", len(batch))
+	s.mu.Lock()
+	// Truncate only the portion we successfully wrote; new events that
+	// arrived while writeBatch was in flight are retained.
+	s.buf = s.buf[n:]
+	// Re-slice to the original capacity so we don't leak.
+	if len(s.buf) == 0 {
+		s.buf = make([]*avroschema.MovementEvent, 0, s.batchSize)
+	} else {
+		tail := make([]*avroschema.MovementEvent, len(s.buf), s.batchSize)
+		copy(tail, s.buf)
+		s.buf = tail
+	}
+	s.mu.Unlock()
+
+	s.logger.Debug("clickhouse batch flushed", "count", n)
 	return nil
 }
 
-// RunFlusher periodically flushes incomplete batches until ctx is cancelled.
-func (s *Sink) RunFlusher(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			// Final flush on shutdown.
-			if err := s.Flush(context.Background()); err != nil {
-				s.logger.Error("final clickhouse flush failed", "err", err)
-			}
-			return
-		case <-s.timer.C:
-			if err := s.Flush(ctx); err != nil {
-				s.logger.Error("clickhouse periodic flush failed", "err", err)
-			}
-		}
-	}
-}
-
-// Close flushes remaining events and closes the connection.
+// Close flushes any remaining events and closes the underlying connection.
+// The caller must have stopped feeding Add() before Close.
 func (s *Sink) Close(ctx context.Context) error {
 	if err := s.Flush(ctx); err != nil {
 		s.logger.Error("close flush failed", "err", err)
@@ -167,34 +206,42 @@ func (s *Sink) writeBatch(ctx context.Context, events []*avroschema.MovementEven
 	return nil
 }
 
-func (s *Sink) resetTimer() {
-	s.timer = time.NewTimer(batchTimeout)
-}
-
-func (s *Sink) resetTimerLocked() {
-	if !s.timer.Stop() {
-		select {
-		case <-s.timer.C:
-		default:
-		}
-	}
-	s.timer.Reset(batchTimeout)
-}
-
-// execStatements splits SQL on semicolons and executes each non-empty
-// statement individually (ClickHouse driver only supports one per Exec).
+// execStatements splits SQL on top-level semicolons and executes each
+// non-empty statement individually (the ClickHouse driver accepts one
+// statement per Exec). This is adequate for our CREATE/CREATE MATERIALIZED
+// VIEW DDL; if the schema ever grows string literals containing `;` or
+// stored-function bodies, switch to a migration tool.
 func execStatements(ctx context.Context, conn driver.Conn, sql string) error {
-	stmts := strings.Split(sql, ";")
-	for _, stmt := range stmts {
-		stmt = strings.TrimSpace(stmt)
-		if stmt == "" || strings.HasPrefix(stmt, "--") {
-			continue
-		}
+	for _, stmt := range splitStatements(sql) {
 		if err := conn.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("exec %q…: %w", truncate(stmt, 60), err)
 		}
 	}
 	return nil
+}
+
+// splitStatements strips full-line comments and splits on top-level `;`.
+func splitStatements(sql string) []string {
+	lines := strings.Split(sql, "\n")
+	cleaned := make([]string, 0, len(lines))
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if strings.HasPrefix(trimmed, "--") || trimmed == "" {
+			continue
+		}
+		cleaned = append(cleaned, l)
+	}
+	body := strings.Join(cleaned, "\n")
+	raw := strings.Split(body, ";")
+	out := make([]string, 0, len(raw))
+	for _, s := range raw {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 func truncate(s string, n int) string {

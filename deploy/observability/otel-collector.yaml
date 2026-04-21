@@ -1,6 +1,11 @@
 # OpenTelemetry Collector configuration for local development.
-# Receives OTLP/HTTP traces on :4318, exports to Jaeger for viewing.
-# Metrics are scraped by Prometheus from the services' :9464/metrics endpoints.
+# Receives OTLP/HTTP traces on :4318, exports to Jaeger via OTLP/gRPC.
+# Service metrics are scraped directly by Prometheus from the services'
+# /metrics endpoints — this collector does not have a metrics pipeline.
+
+extensions:
+  health_check:
+    endpoint: "0.0.0.0:13133"
 
 receivers:
   otlp:
@@ -16,14 +21,15 @@ processors:
 exporters:
   debug:
     verbosity: basic
-  otlphttp/jaeger:
-    endpoint: "http://jaeger:4318"
+  otlp/jaeger:
+    endpoint: "jaeger:4317"
     tls:
       insecure: true
 
 service:
+  extensions: [health_check]
   pipelines:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug, otlphttp/jaeger]
+      exporters: [debug, otlp/jaeger]
