@@ -28,6 +28,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -66,7 +67,13 @@ func Init(ctx context.Context, serviceName string, logger *slog.Logger) (shutdow
 	}
 
 	// --- Traces: OTLP/HTTP → collector ---
-	traceExporter, err := otlptracehttp.New(ctx)
+	// WithInsecure matches the comment at the top of the file: in local dev
+	// the collector is plain HTTP on :4318. The Go OTLP/HTTP SDK defaults to
+	// HTTPS when no scheme is given in OTEL_EXPORTER_OTLP_ENDPOINT, so
+	// without this flag every export fails with "server gave HTTP response
+	// to HTTPS client". Override by setting OTEL_EXPORTER_OTLP_ENDPOINT
+	// explicitly to an https URL for TLS-terminated collectors.
+	traceExporter, err := otlptracehttp.New(ctx, otlptracehttp.WithInsecure())
 	if err != nil {
 		return nil, fmt.Errorf("otlp trace exporter: %w", err)
 	}
@@ -75,6 +82,13 @@ func Init(ctx context.Context, serviceName string, logger *slog.Logger) (shutdow
 		sdktrace.WithResource(res),
 	)
 	otel.SetTracerProvider(tp)
+	// W3C TraceContext is load-bearing: without a global propagator,
+	// otel.GetTextMapPropagator().Inject / Extract are no-ops and no
+	// traceparent flows through Kafka headers or HTTP requests.
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
 	teardown = append(teardown, tp.Shutdown)
 
 	// --- Metrics: Prometheus scrape endpoint ---

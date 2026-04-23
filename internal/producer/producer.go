@@ -12,8 +12,18 @@ import (
 	"time"
 
 	"github.com/nis94/dream-mobility/internal/avro"
+	"github.com/nis94/dream-mobility/internal/tracing"
 	"github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// tracer is the package-level OTel tracer. Using a package-level var keeps
+// the API of Producer unchanged — callers don't have to pass a tracer.
+var tracer = otel.Tracer("github.com/nis94/dream-mobility/internal/producer")
 
 // srHTTPClient bounds each Schema Registry request. The caller can further
 // bound total operation time via context.
@@ -67,6 +77,10 @@ func New(ctx context.Context, brokers []string, topic, schemaRegistryURL string,
 
 // Produce serializes the event and writes it to Kafka.
 // Key = "entity_type:entity_id" (for per-entity partition affinity).
+//
+// A child span "kafka.produce" is started under the caller's context and its
+// W3C TraceContext is injected into the outgoing message headers so the
+// consumer can continue the same trace.
 func (p *Producer) Produce(ctx context.Context, event *avro.MovementEvent) error {
 	avroBytes, err := event.Marshal()
 	if err != nil {
@@ -76,10 +90,32 @@ func (p *Producer) Produce(ctx context.Context, event *avro.MovementEvent) error
 	value := p.encodeWireFormat(avroBytes)
 	key := event.EntityType + ":" + event.EntityID
 
-	return p.writer.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(key),
-		Value: value,
-	})
+	ctx, span := tracer.Start(ctx, "kafka.produce",
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			semconv.MessagingSystemKafka,
+			semconv.MessagingDestinationName(p.writer.Topic),
+			semconv.MessagingKafkaMessageKey(key),
+			attribute.String("event.id", event.EventID),
+			attribute.String("entity.type", event.EntityType),
+			attribute.String("entity.id", event.EntityID),
+		),
+	)
+	defer span.End()
+
+	headers := tracing.KafkaHeaderCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, &headers)
+
+	if err := p.writer.WriteMessages(ctx, kafka.Message{
+		Key:     []byte(key),
+		Value:   value,
+		Headers: []kafka.Header(headers),
+	}); err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		span.RecordError(err)
+		return err
+	}
+	return nil
 }
 
 // Close flushes pending writes and closes the Kafka connection.

@@ -18,6 +18,7 @@ import (
 	"github.com/nis94/dream-mobility/internal/config"
 	otelinit "github.com/nis94/dream-mobility/internal/otel"
 	"github.com/nis94/dream-mobility/internal/producer"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 const (
@@ -85,7 +86,11 @@ func run(logger *slog.Logger) error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok")
 	})
-	r.Post("/events", h.Ingest)
+	// otelhttp starts an HTTP server span per request and extracts W3C
+	// TraceContext from incoming headers — useful if an upstream client
+	// passes traceparent (curl, k6, another service). Wrapping only the
+	// POST route keeps /health free of trace overhead.
+	r.Method(http.MethodPost, "/events", otelhttp.NewHandler(http.HandlerFunc(h.Ingest), "POST /events"))
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.HTTPPort,

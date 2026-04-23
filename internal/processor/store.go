@@ -9,6 +9,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	avroschema "github.com/nis94/dream-mobility/internal/avro"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 //go:embed schema.sql
@@ -91,10 +94,20 @@ type InsertResult struct {
 // the existing row wins. A future ClickHouse ReplacingMergeTree sink MUST
 // use `version = event_ts` to keep the two stores consistent.
 func (s *Store) InsertEvent(ctx context.Context, ev *avroschema.MovementEvent) (InsertResult, error) {
+	ctx, span := tracer.Start(ctx, "postgres.insert_event",
+		trace.WithAttributes(
+			attribute.String("event.id", ev.EventID),
+			attribute.String("entity.type", ev.EntityType),
+		),
+	)
+	defer span.End()
+
 	var result InsertResult
 
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
+		span.SetStatus(codes.Error, "begin tx")
+		span.RecordError(err)
 		return result, fmt.Errorf("begin tx: %w", err)
 	}
 	// Use a detached context for rollback: if the request ctx was cancelled
@@ -103,7 +116,8 @@ func (s *Store) InsertEvent(ctx context.Context, ev *avroschema.MovementEvent) (
 	defer func() { _ = tx.Rollback(context.Background()) }()
 
 	// 1) Raw event insert — dedupe by event_id.
-	tag, err := tx.Exec(ctx, `
+	rawCtx, rawSpan := tracer.Start(ctx, "pg.insert raw_events")
+	tag, err := tx.Exec(rawCtx, `
 		INSERT INTO raw_events (
 			event_id, entity_type, entity_id, event_ts,
 			lat, lon, speed_kmh, heading_deg, accuracy_m,
@@ -115,14 +129,21 @@ func (s *Store) InsertEvent(ctx context.Context, ev *avroschema.MovementEvent) (
 		ev.Source, attributesToJSONB(ev.Attributes),
 	)
 	if err != nil {
+		rawSpan.SetStatus(codes.Error, "insert raw_events")
+		rawSpan.RecordError(err)
+		rawSpan.End()
+		span.SetStatus(codes.Error, "insert raw_events")
 		return result, fmt.Errorf("insert raw_events: %w", err)
 	}
 	result.RawInserted = tag.RowsAffected() > 0
+	rawSpan.SetAttributes(attribute.Bool("pg.raw_inserted", result.RawInserted))
+	rawSpan.End()
 
 	// 2) Entity position upsert — timestamp-gated.
 	// The WHERE clause ensures a stale (out-of-order) event does NOT
 	// overwrite a position that already has a more recent event_ts.
-	tag, err = tx.Exec(ctx, `
+	posCtx, posSpan := tracer.Start(ctx, "pg.upsert entity_positions")
+	tag, err = tx.Exec(posCtx, `
 		INSERT INTO entity_positions (
 			entity_type, entity_id, event_ts, lat, lon, last_event_id
 		) VALUES ($1,$2,$3,$4,$5,$6)
@@ -138,13 +159,25 @@ func (s *Store) InsertEvent(ctx context.Context, ev *avroschema.MovementEvent) (
 		ev.Lat, ev.Lon, ev.EventID,
 	)
 	if err != nil {
+		posSpan.SetStatus(codes.Error, "upsert entity_positions")
+		posSpan.RecordError(err)
+		posSpan.End()
+		span.SetStatus(codes.Error, "upsert entity_positions")
 		return result, fmt.Errorf("upsert entity_positions: %w", err)
 	}
 	result.PositionUpdated = tag.RowsAffected() > 0
+	posSpan.SetAttributes(attribute.Bool("pg.position_updated", result.PositionUpdated))
+	posSpan.End()
 
 	if err := tx.Commit(ctx); err != nil {
+		span.SetStatus(codes.Error, "commit")
+		span.RecordError(err)
 		return result, fmt.Errorf("commit: %w", err)
 	}
+	span.SetAttributes(
+		attribute.Bool("pg.raw_inserted", result.RawInserted),
+		attribute.Bool("pg.position_updated", result.PositionUpdated),
+	)
 	return result, nil
 }
 

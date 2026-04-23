@@ -26,7 +26,10 @@ scrape_configs:
 
   - job_name: "stream-processor"
     static_configs:
-      - targets: ["host.docker.internal:9466"]
+      - targets:
+          - "host.docker.internal:9466"
+          - "host.docker.internal:9476"
+          - "host.docker.internal:9486"
     metrics_path: /metrics
 
   - job_name: "clickhouse-sink"

@@ -48,12 +48,25 @@ would trip over.
 - Opt-in overlay compose:
   `docker compose -f deploy/docker-compose.yml
   -f deploy/observability/docker-compose.observability.yml -p dream-mobility up -d`.
-- The OTel SDK is initialized in every `cmd/*/main.go`, but **no
-  custom metrics or spans are registered anywhere in the code**. The
-  `/metrics` endpoints expose only Go runtime + process metrics, and
-  Jaeger receives zero spans. Adding real app metrics / traces is
-  deferred work.
+- OTel SDK is initialized in every `cmd/*/main.go`. The OTLP/HTTP
+  exporter **must** use `otlptracehttp.WithInsecure()` against the
+  local collector (the SDK defaults to HTTPS otherwise and every
+  export silently fails with `server gave HTTP response to HTTPS
+  client`).
+- **Custom metrics**: still none. `/metrics` is Go runtime + process
+  only. Adding ingest/sink counters is deferred work.
+- **Traces**: the `POST /events` → Kafka → stream-processor →
+  Postgres path is instrumented end-to-end. W3C TraceContext rides
+  on Kafka message headers via the carrier in
+  `internal/tracing/kafka.go`. clickhouse-sink and archiver are not
+  yet instrumented.
 - Prometheus is reachable from Grafana at
   `http://dm-prometheus:9090` (the docker-network hostname), not
-  `localhost`. Datasource has to be provisioned by hand today.
+  `localhost`. Jaeger is reachable the same way at
+  `http://dm-jaeger:16686`. Datasources are provisioned by hand
+  today (`curl -u admin:admin -X POST /api/datasources`).
 - Grafana runs with anonymous Viewer + `admin/admin` for edit. Dev-only.
+- `deploy/observability/prometheus.yml` statically scrapes three
+  `stream-processor` ports (9466/9476/9486) so three local replicas
+  are visible. This is a local-dev hack — in k8s swap for a
+  `PodMonitor` label selector.

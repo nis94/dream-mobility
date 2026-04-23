@@ -7,8 +7,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nis94/dream-mobility/internal/tracing"
 	"github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var tracer = otel.Tracer("github.com/nis94/dream-mobility/internal/processor")
 
 // commitTimeout bounds the detached CommitMessages call during shutdown.
 // The request context may already be cancelled; we still want the offset
@@ -135,9 +143,28 @@ func (p *Processor) runStatsSampler(ctx context.Context) {
 }
 
 func (p *Processor) processMessage(ctx context.Context, msg kafka.Message) error {
+	// Continue the producer's trace if a traceparent was carried on the
+	// message. Missing headers → root span (useful for tools that write
+	// directly to Kafka without going through ingest-api).
+	carrier := tracing.KafkaHeaderCarrier(msg.Headers)
+	ctx = otel.GetTextMapPropagator().Extract(ctx, &carrier)
+
+	ctx, span := tracer.Start(ctx, "kafka.consume",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			semconv.MessagingSystemKafka,
+			semconv.MessagingDestinationName(msg.Topic),
+			attribute.Int("messaging.kafka.partition", msg.Partition),
+			attribute.Int64("messaging.kafka.offset", msg.Offset),
+		),
+	)
+	defer span.End()
+
 	event, err := decodeMovementEvent(msg.Value)
 	if err != nil {
 		p.decodeFailures.Add(1)
+		span.SetStatus(codes.Error, "decode failed")
+		span.RecordError(err)
 		p.logger.Warn("decode failed, skipping message",
 			"partition", msg.Partition, "offset", msg.Offset,
 			"payload_len", len(msg.Value), "err", err)
@@ -146,12 +173,23 @@ func (p *Processor) processMessage(ctx context.Context, msg kafka.Message) error
 		// that this is happening.
 		return nil
 	}
+	span.SetAttributes(
+		attribute.String("event.id", event.EventID),
+		attribute.String("entity.type", event.EntityType),
+		attribute.String("entity.id", event.EntityID),
+	)
 
 	start := time.Now()
 	result, err := p.store.InsertEvent(ctx, event)
 	if err != nil {
+		span.SetStatus(codes.Error, "store insert failed")
+		span.RecordError(err)
 		return err
 	}
+	span.SetAttributes(
+		attribute.Bool("pg.raw_inserted", result.RawInserted),
+		attribute.Bool("pg.position_updated", result.PositionUpdated),
+	)
 
 	p.logger.Debug("event processed",
 		"event_id", event.EventID,

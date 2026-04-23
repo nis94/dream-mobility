@@ -13,7 +13,13 @@ import (
 	"time"
 
 	"github.com/nis94/dream-mobility/internal/avro"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var tracer = otel.Tracer("github.com/nis94/dream-mobility/internal/api")
 
 // maxRequestBody caps the POST body size. Oversized requests are rejected with
 // HTTP 413 via http.MaxBytesReader's typed error.
@@ -67,30 +73,7 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 	resp := IngestResponse{Errors: make([]EventError, 0, len(events))}
 	for i := range events {
 		ev := &events[i]
-
-		ts, err := ValidateEvent(ev)
-		if err != nil {
-			resp.Rejected++
-			resp.Errors = append(resp.Errors, EventError{
-				Index:   i,
-				EventID: ev.EventID,
-				Error:   err.Error(),
-			})
-			continue
-		}
-
-		avroEvent := mapToAvro(ev, ts)
-		if err := h.producer.Produce(r.Context(), avroEvent); err != nil {
-			h.logger.Error("kafka produce failed", "event_id", ev.EventID, "err", err)
-			resp.Rejected++
-			resp.Errors = append(resp.Errors, EventError{
-				Index:   i,
-				EventID: ev.EventID,
-				Error:   "internal: failed to produce to Kafka",
-			})
-			continue
-		}
-		resp.Accepted++
+		h.processOne(r.Context(), i, ev, &resp)
 	}
 
 	status := http.StatusAccepted
@@ -98,6 +81,51 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusBadRequest
 	}
 	h.writeJSON(w, status, resp)
+}
+
+// processOne validates + produces a single event inside its own span so each
+// event gets a distinct trace root. Mutations to resp are serialized by the
+// caller's single-threaded loop.
+func (h *Handler) processOne(ctx context.Context, i int, ev *EventRequest, resp *IngestResponse) {
+	ctx, span := tracer.Start(ctx, "ingest.event",
+		trace.WithAttributes(
+			attribute.Int("event.index", i),
+			attribute.String("event.id", ev.EventID),
+		),
+	)
+	defer span.End()
+
+	ts, err := ValidateEvent(ev)
+	if err != nil {
+		span.SetStatus(codes.Error, "validation failed")
+		span.SetAttributes(attribute.String("error.reason", err.Error()))
+		resp.Rejected++
+		resp.Errors = append(resp.Errors, EventError{
+			Index:   i,
+			EventID: ev.EventID,
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	avroEvent := mapToAvro(ev, ts)
+	span.SetAttributes(
+		attribute.String("entity.type", avroEvent.EntityType),
+		attribute.String("entity.id", avroEvent.EntityID),
+	)
+	if err := h.producer.Produce(ctx, avroEvent); err != nil {
+		span.SetStatus(codes.Error, "produce failed")
+		span.RecordError(err)
+		h.logger.Error("kafka produce failed", "event_id", ev.EventID, "err", err)
+		resp.Rejected++
+		resp.Errors = append(resp.Errors, EventError{
+			Index:   i,
+			EventID: ev.EventID,
+			Error:   "internal: failed to produce to Kafka",
+		})
+		return
+	}
+	resp.Accepted++
 }
 
 // parseRequestBody reads up to maxRequestBody from the request and delegates
