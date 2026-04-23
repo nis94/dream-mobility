@@ -1,0 +1,18 @@
+# values-kind.yaml — overrides for running stream-processor in kind against
+# docker-compose Postgres + Kafka on the host. See
+# deploy/helm/ingest-api/values-kind.yaml for the host.docker.internal +
+# PLAINTEXT_KIND listener rationale.
+
+replicaCount: 3              # matches the topic's 3 partitions so every
+                             # consumer gets exactly one partition
+
+image:
+  pullPolicy: Never
+
+env:
+  PROM_PORT: "9466"
+  KAFKA_BROKERS: "host.docker.internal:39092"
+  KAFKA_TOPIC: "movement.events"
+  KAFKA_GROUP_ID: "mobility-postgres"
+  POSTGRES_DSN: "postgres://postgres:postgres@host.docker.internal:5432/mobility?sslmode=disable"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"

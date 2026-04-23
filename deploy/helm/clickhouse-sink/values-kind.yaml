@@ -1,0 +1,13 @@
+# values-kind.yaml — clickhouse-sink override for kind cluster.
+
+image:
+  pullPolicy: Never
+
+env:
+  PROM_PORT: "9467"
+  KAFKA_BROKERS: "host.docker.internal:39092"
+  KAFKA_TOPIC: "movement.events"
+  KAFKA_GROUP_ID: "mobility-clickhouse"
+  CLICKHOUSE_ADDR: "host.docker.internal:9000"
+  CLICKHOUSE_DB: "mobility"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"

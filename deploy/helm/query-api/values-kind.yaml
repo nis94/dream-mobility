@@ -1,0 +1,18 @@
+# values-kind.yaml — query-api override for kind cluster.
+
+image:
+  pullPolicy: Never
+
+service:
+  type: NodePort
+  port: 8090
+  targetPort: 8090
+  # No nodePort set → kind picks one in the 30000-32767 range. We don't
+  # forward this one from host because /entities queries are read-only and
+  # can go through `kubectl port-forward` when needed.
+
+env:
+  QUERY_HTTP_PORT: "8090"
+  PROM_PORT: "9465"
+  POSTGRES_DSN: "postgres://postgres:postgres@host.docker.internal:5432/mobility?sslmode=disable"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"

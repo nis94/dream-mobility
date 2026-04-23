@@ -44,9 +44,14 @@ services:
       #   PLAINTEXT       -- intra-cluster + service-to-service inside the docker network
       #   CONTROLLER      -- KRaft control plane
       #   PLAINTEXT_HOST  -- exposed to host on 29092 for kcat/CLI tools
-      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:29092'
-      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092'
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      #   PLAINTEXT_KIND  -- exposed on 39092 for kind pods that resolve
+      #                      host.docker.internal. A third listener is
+      #                      needed because one listener can only advertise
+      #                      one name, and the host needs 'localhost' while
+      #                      kind pods need 'host.docker.internal'.
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:29092,PLAINTEXT_KIND://0.0.0.0:39092'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092,PLAINTEXT_KIND://host.docker.internal:39092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,PLAINTEXT_KIND:PLAINTEXT'
       KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
       KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
       # Single-node defaults
@@ -63,6 +68,7 @@ services:
       CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qg'
     ports:
       - "29092:29092"
+      - "39092:39092"
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:

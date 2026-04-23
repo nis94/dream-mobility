@@ -1,0 +1,27 @@
+# values-kind.yaml — overrides for running ingest-api in the local kind
+# cluster (scripts/kind-up.sh) against docker-compose infra on the host.
+#
+# Pods reach host-exposed services via host.docker.internal — a name Docker
+# Desktop injects into container DNS so kind nodes can loop back to the
+# Mac's localhost ports.
+#
+# Kafka PLAINTEXT_KIND listener runs on host 39092; see deploy/docker-compose.yml
+# (the regular 29092 listener advertises as 'localhost' which a kind pod
+# cannot resolve).
+
+image:
+  pullPolicy: Never          # images are `kind load`-ed, not pulled
+
+service:
+  type: NodePort
+  port: 8080
+  targetPort: 8080
+  nodePort: 30080            # forwarded by kind-cluster.yaml to host 8080
+
+env:
+  HTTP_PORT: "8080"
+  PROM_PORT: "9464"
+  KAFKA_BROKERS: "host.docker.internal:39092"
+  KAFKA_TOPIC: "movement.events"
+  SCHEMA_REGISTRY_URL: "http://host.docker.internal:8081"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"
