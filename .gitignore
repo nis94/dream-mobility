@@ -14,4 +14,8 @@ coverage.*
 # Docker / compose
 deploy/data/
 
+# Claude Code harness local state
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+
 # Generated code is checked in; do not ignore *.pb.go
