@@ -1,0 +1,182 @@
+{
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Gauge: number of messages this consumer is behind the topic's high-water mark. Sustained > 0 means the sink can't keep up with ingest.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "targets": [
+        {
+          "expr": "kafka_consumer_lag",
+          "legendFormat": "{{app}} — {{instance}}"
+        }
+      ],
+      "title": "Consumer lag per pod (messages behind HWM)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Worst-case lag across all pods in each consumer group. With 1 replica per group this equals the per-pod value; kept as the alerting query that generalizes to any replica count.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "max by (app) (kafka_consumer_lag)",
+          "legendFormat": "{{app}}"
+        }
+      ],
+      "title": "Max lag per consumer group",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Per-pod consumption throughput. Sum across pods = total consumer-group rate.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal"
+            }
+          },
+          "unit": "ops"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "rate(kafka_messages_total[5m])",
+          "legendFormat": "{{app}} — {{instance}}"
+        }
+      ],
+      "title": "Message rate per pod (msg/s, 5m avg)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "rate(kafka_bytes_total[5m])",
+          "legendFormat": "{{app}} — {{instance}}"
+        }
+      ],
+      "title": "Byte rate per pod (bytes/s, 5m avg)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Messages that couldn't be decoded and were committed past. Any non-zero value deserves attention. Scrape health and replica count live on the Runtime dashboard.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "id": 5,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "expr": "kafka_decode_failures_total",
+          "legendFormat": "{{app}} — {{instance}}"
+        }
+      ],
+      "title": "Decode failures (total since pod start)",
+      "type": "stat"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "dream",
+    "kafka"
+  ],
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "Dream Mobility — Kafka Consumers",
+  "uid": "dream-kafka",
+  "datasource": null
+}

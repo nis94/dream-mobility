@@ -75,6 +75,15 @@ services:
       - "127.0.0.1:3000:3000"
     volumes:
       - grafana-data:/var/lib/grafana
+      # Datasources + dashboards provisioned from the repo. Any
+      # `deploy/grafana/provisioning/dashboards/**/*.json` is loaded at
+      # startup and re-read every `updateIntervalSeconds` (10s). Wipe
+      # `grafana-data` and restart — the setup comes back from Git.
+      #
+      # Relative paths in compose are resolved against the first `-f`
+      # file's directory (`deploy/`), not this overlay's directory —
+      # hence `./grafana/...`, not `../grafana/...`.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
     healthcheck:
       <<: *hc-defaults
       test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]

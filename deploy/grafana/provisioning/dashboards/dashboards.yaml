@@ -1,0 +1,22 @@
+# Grafana dashboard provisioning — tells Grafana to load every *.json
+# under options.path at startup and keep re-reading the directory every
+# updateIntervalSeconds. Mounted read-only into the container so UI
+# edits don't persist across restart (they're lost; commit to Git to
+# make a change durable).
+#
+# allowUiUpdates=true is a compromise: let users tweak a panel in the
+# UI temporarily while iterating, but the authoritative source is the
+# file in Git. Disable this for a strict "look don't touch" setup.
+apiVersion: 1
+
+providers:
+  - name: dream-mobility
+    orgId: 1
+    folder: 'Dream Mobility'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/dream-mobility
+      foldersFromFilesStructure: false

@@ -1,0 +1,39 @@
+# Grafana datasource provisioning — Grafana reads this at startup and
+# creates/updates the datasources declaratively. Committing this file to
+# Git makes the Grafana instance reproducible from scratch: a new volume
+# gets the same datasources as the existing one.
+#
+# UIDs are pinned so dashboard JSONs can reference them by a stable key
+# (rather than the random UID Grafana generates on first API-create).
+#
+# This file is mounted into the container at
+# /etc/grafana/provisioning/datasources/datasources.yaml by the observability
+# compose overlay.
+apiVersion: 1
+
+datasources:
+  # Prometheus lives in the kind cluster, exposed to the host via kind's
+  # extraPortMapping 30091 -> host 9091 (see deploy/kind/kind-cluster.yaml).
+  # From the Grafana container (docker network), host.docker.internal
+  # resolves to the Mac loopback.
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://host.docker.internal:9091
+    isDefault: true
+    editable: false
+
+  # Jaeger lives alongside Grafana in the observability compose overlay.
+  # Same docker network, so we reach it by its compose service name.
+  - name: Jaeger
+    uid: jaeger
+    type: jaeger
+    access: proxy
+    url: http://dm-jaeger:16686
+    editable: false
+    jsonData:
+      # Clicking a span in the trace view offers a "View logs / metrics"
+      # drill-down via the Prometheus datasource above.
+      tracesToMetrics:
+        datasourceUid: prometheus
