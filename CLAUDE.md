@@ -43,6 +43,32 @@ would trip over.
   producer keys on `entity_type:entity_id` — same key → same partition
   → single consumer.
 
+## Kubernetes / GitOps layout
+
+- The **compose stack owns infra**; the **kind cluster owns the four Go
+  services** (ingest-api, stream-processor, query-api, clickhouse-sink).
+  Kind pods reach compose infra via `host.docker.internal`. See
+  `deploy/kind/kind-cluster.yaml` for node port mappings
+  (30080→host:8080, 30443→host:8443).
+- Kafka has **three** listeners: 9092 for the docker network, 29092
+  (advertised as `localhost`) for host-side Python tools, 39092
+  (advertised as `host.docker.internal`) for kind pods. One listener
+  can only advertise one name, so all three are necessary.
+- Helm values are split: `values.yaml` holds production-ish defaults
+  (in-cluster DNS like `postgres:5432`); `values-kind.yaml` overrides
+  them with `host.docker.internal` for the kind case.
+- `scripts/kind-up.sh` + `scripts/kind-deploy.sh` bootstrap the whole
+  local k8s setup; `scripts/kind-deploy.sh` is the imperative path
+  (direct `helm install`). **ArgoCD is the declarative path** and
+  supersedes it in steady state.
+- **ArgoCD is installed in the `argocd` namespace**; UI at
+  `https://localhost:8443` (NodePort 30443), admin password is in
+  the `argocd-initial-admin-secret` Secret.
+- `deploy/argocd/root.yaml` is the app-of-apps entry point —
+  `kubectl apply -f` once and ArgoCD picks up every file under
+  `deploy/argocd/apps/` automatically. `automated.prune + selfHeal`
+  are on, so manual `kubectl edit` drifts are reverted.
+
 ## Observability stack caveats
 
 - Opt-in overlay compose:
