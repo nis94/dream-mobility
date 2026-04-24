@@ -9,8 +9,9 @@
 # (the regular 29092 listener advertises as 'localhost' which a kind pod
 # cannot resolve).
 
-replicaCount: 2              # HA front door — behind the NodePort, one
-                             # pod can roll without dropping ingest
+# replicaCount inherits 1 from values.yaml. A second replica is an HA
+# nice-to-have (the NodePort can roll without dropping ingest) but not
+# required for correctness — set to 2+ here when load justifies it.
 
 image:
   pullPolicy: Never          # images are `kind load`-ed, not pulled

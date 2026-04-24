@@ -3,8 +3,10 @@
 # deploy/helm/ingest-api/values-kind.yaml for the host.docker.internal +
 # PLAINTEXT_KIND listener rationale.
 
-replicaCount: 3              # matches the topic's 3 partitions so every
-                             # consumer gets exactly one partition
+# replicaCount inherits 1 from values.yaml. The topic has 3 partitions, so
+# one pod consumes all three sequentially (per-entity ordering is still
+# preserved — Murmur2 keyed partitions, one consumer per partition, here
+# same consumer across all three). Raise to 3 when throughput warrants it.
 
 image:
   pullPolicy: Never
