@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/nis94/dream-mobility/internal/kafkametrics"
@@ -200,11 +201,22 @@ func NewReader(brokers []string, topic, groupID string, logger *slog.Logger) *ka
 }
 
 // kafkaLogger adapts slog to kafka-go's Logger interface.
+//
+// segmentio/kafka-go's long-poll heartbeat fires on every idle fetch
+// window — a line like:
+//   "no messages received from kafka within the allocated time for
+//    partition X of <topic> at offset Y: [7] Request Timed Out: ..."
+// is benign and spams every few seconds per partition. Filter it here
+// so DEBUG-level logs stay useful (event processed, offset commits,
+// batch flushes) without the idle noise.
 type kafkaLogger struct {
 	logger *slog.Logger
 	level  slog.Level
 }
 
 func (l kafkaLogger) Printf(format string, args ...interface{}) {
+	if strings.Contains(format, "no messages received from kafka within the allocated time") {
+		return
+	}
 	l.logger.Log(context.Background(), l.level, fmt.Sprintf(format, args...))
 }
