@@ -21,6 +21,9 @@ env:
   KAFKA_TOPIC: "movement.events"
   SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+  # INFO is the production default. Override to DEBUG in values-kind.yaml
+  # or via kubectl set env to see per-request detail.
+  LOG_LEVEL: "INFO"
 
 resources:
   requests:

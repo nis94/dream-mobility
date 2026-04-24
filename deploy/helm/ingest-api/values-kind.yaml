@@ -29,3 +29,7 @@ env:
   KAFKA_TOPIC: "movement.events"
   SCHEMA_REGISTRY_URL: "http://host.docker.internal:8081"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"
+  # DEBUG in kind so the learning loop sees per-event log lines. Flip
+  # back to INFO via Helm override (or kubectl set env) if the volume
+  # gets in the way.
+  LOG_LEVEL: "DEBUG"

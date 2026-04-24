@@ -18,3 +18,4 @@ env:
   PROM_PORT: "9465"
   POSTGRES_DSN: "postgres://postgres:postgres@host.docker.internal:5432/mobility?sslmode=disable"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"
+  LOG_LEVEL: "DEBUG"

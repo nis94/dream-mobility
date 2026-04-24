@@ -2,10 +2,29 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"strings"
 )
+
+// ParseLogLevel reads the LOG_LEVEL env (DEBUG / INFO / WARN / ERROR,
+// case-insensitive) and returns the matching slog.Level. Unset or
+// unrecognized values fall back to Info — the safe production default.
+// DEBUG in particular exposes per-event Processing lines from the
+// stream-processor and per-batch flush lines from the clickhouse-sink.
+func ParseLogLevel(raw string) slog.Level {
+	switch strings.ToUpper(strings.TrimSpace(raw)) {
+	case "DEBUG":
+		return slog.LevelDebug
+	case "WARN", "WARNING":
+		return slog.LevelWarn
+	case "ERROR":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
 
 // Config holds application configuration, loaded from environment variables.
 // Each service uses the subset of fields it needs; unused fields carry defaults.

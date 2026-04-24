@@ -11,3 +11,4 @@ env:
   CLICKHOUSE_ADDR: "host.docker.internal:9000"
   CLICKHOUSE_DB: "mobility"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"
+  LOG_LEVEL: "DEBUG"

@@ -16,6 +16,7 @@ env:
   # POSTGRES_DSN unset so the chart reads from the Secret.
   POSTGRES_DSN: "postgres://postgres:postgres@postgres:5432/mobility?sslmode=disable"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+  LOG_LEVEL: "INFO"
 
 # postgresSecret:
 #   name: dm-postgres-dsn

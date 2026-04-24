@@ -15,6 +15,7 @@ env:
   CLICKHOUSE_ADDR: "clickhouse:9000"
   CLICKHOUSE_DB: "mobility"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+  LOG_LEVEL: "INFO"
 
 resources:
   requests:

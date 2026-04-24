@@ -31,7 +31,9 @@ const (
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: config.ParseLogLevel(os.Getenv("LOG_LEVEL")),
+	}))
 	slog.SetDefault(logger)
 	if err := run(logger); err != nil {
 		logger.Error("fatal", "err", err)

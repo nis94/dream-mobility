@@ -22,6 +22,7 @@ env:
   # deployment pulls the DSN from a Kubernetes Secret via valueFrom.
   POSTGRES_DSN: "postgres://postgres:postgres@postgres:5432/mobility?sslmode=disable"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+  LOG_LEVEL: "INFO"
 
 # Production override — uncomment to pull the DSN from a Secret.
 # When set, the template ignores the inline POSTGRES_DSN above.
