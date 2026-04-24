@@ -7,6 +7,9 @@ deploy/observability
 loadtest
 tools/generator
 services
+# Un-ignore the archiver — it has its own Dockerfile at services/archiver/
+# and needs the source + pyproject + lock inside the build context.
+!services/archiver
 migrations
 scripts
 **/*_test.go

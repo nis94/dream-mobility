@@ -1,0 +1,21 @@
+# values-kind.yaml — overrides for running the archiver in kind against
+# docker-compose Kafka + MinIO + Iceberg REST on the host. Matches the
+# host.docker.internal + PLAINTEXT_KIND listener pattern used by the four
+# Go-service charts.
+
+image:
+  pullPolicy: Never
+
+env:
+  KAFKA_BROKERS: "host.docker.internal:39092"
+  KAFKA_TOPIC: "movement.events"
+  KAFKA_GROUP_ID: "mobility-iceberg"
+  ICEBERG_CATALOG_URI: "http://host.docker.internal:8181"
+  ICEBERG_WAREHOUSE: "s3://lake/"
+  S3_ENDPOINT: "http://host.docker.internal:9100"
+  S3_ACCESS_KEY: "minioadmin"
+  S3_SECRET_KEY: "minioadmin"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"
+  # TODO: archiver.py hardcodes logging.INFO; LOG_LEVEL is plumbed through
+  # the chart so the override takes effect once the code reads the env var.
+  LOG_LEVEL: "DEBUG"

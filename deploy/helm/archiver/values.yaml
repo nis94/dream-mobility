@@ -1,0 +1,51 @@
+# replicaCount is hardcoded to 1 in the template — the in-memory flush buffer
+# is per-pod and is discarded on Kafka rebalance without special handling, so
+# scaling replicas would lose in-flight events. Lift to multiple replicas
+# only after the archiver persists or flushes on partition-revoke.
+replicaCount: 1
+
+image:
+  repository: dream-mobility/archiver
+  tag: ""          # defaults to Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# TODO: the archiver does not expose a Prometheus /metrics endpoint today, so
+# there is no metricsPort / scrape annotation / readiness probe on an HTTP
+# port. Add a metrics exporter and wire probes back to it when implemented.
+
+env:
+  KAFKA_BROKERS: "kafka:9092"
+  KAFKA_TOPIC: "movement.events"
+  # Must match the consumer group the host-side archiver uses so offsets
+  # are shared if the two ever switch roles.
+  KAFKA_GROUP_ID: "mobility-iceberg"
+  ICEBERG_CATALOG_URI: "http://iceberg-rest:8181"
+  ICEBERG_WAREHOUSE: "s3://lake/"
+  S3_ENDPOINT: "http://minio:9100"
+  # DEV-ONLY defaults. For any non-local deployment set s3Secret below and
+  # remove these inline values so the chart reads creds from the Secret.
+  S3_ACCESS_KEY: "minioadmin"
+  S3_SECRET_KEY: "minioadmin"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+  # TODO: archiver.py currently hardcodes logging.INFO and does not honor
+  # LOG_LEVEL. Kept here so values-kind.yaml can set it once the code reads
+  # the env var, without a second chart bump.
+  LOG_LEVEL: "INFO"
+
+# Uncomment to source S3 credentials from a Secret instead of .Values.env.
+# When set, the template binds S3_ACCESS_KEY / S3_SECRET_KEY via
+# valueFrom.secretKeyRef and the matching keys in .Values.env are ignored.
+# s3Secret:
+#   name: dm-archiver-s3
+#   accessKeyIdKey: accessKeyId
+#   secretAccessKeyKey: secretAccessKey
+
+resources:
+  requests:
+    memory: "256Mi"
+    cpu: "100m"
+  limits:
+    # PyArrow + PyIceberg spill Parquet row groups to memory during flush;
+    # 512Mi is a safe headroom for the default 10k-row flush batch.
+    memory: "512Mi"
+    cpu: "500m"

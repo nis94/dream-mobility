@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-archiver
+  labels:
+    app: archiver
+    release: {{ .Release.Name }}
+spec:
+  # Hardcoded to 1 — see the replicaCount note in values.yaml. The archiver's
+  # in-memory flush buffer is per-pod and is lost on partition rebalance, so
+  # running multiple replicas in the same consumer group would drop in-flight
+  # events. Three partitions of movement.events all flow through this single
+  # pod today; raise only after the flush path is rebalance-safe.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: archiver
+      release: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: archiver
+        release: {{ .Release.Name }}
+      # No prometheus.io/scrape annotation on purpose — the archiver does not
+      # expose a /metrics endpoint. Adding the annotation would just give
+      # Prometheus a permanently-failing target.
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: archiver
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            {{- range $key, $value := .Values.env }}
+            {{- if and $.Values.s3Secret (or (eq $key "S3_ACCESS_KEY") (eq $key "S3_SECRET_KEY")) }}
+            {{- /* Skip inline creds when a Secret reference is provided. */ -}}
+            {{- else }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.s3Secret }}
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3Secret.name }}
+                  key: {{ .Values.s3Secret.accessKeyIdKey | default "accessKeyId" }}
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3Secret.name }}
+                  key: {{ .Values.s3Secret.secretAccessKeyKey | default "secretAccessKey" }}
+            {{- end }}
+          # No readiness probe — with no HTTP port and no external signal for
+          # "consumer has joined the group", any readiness check would either
+          # be a lie or reduce to the liveness check below. A Deployment with
+          # replicas=1 also has no traffic gating benefit from readiness.
+          #
+          # Liveness uses pgrep against the archiver process. The Python
+          # entrypoint is `.../python archiver.py`, which pgrep -f matches
+          # on the full command line. If the process exits (OOM, fatal
+          # Kafka error), the probe fails and the pod is restarted. This is
+          # a liveness-only signal — it does NOT verify the consumer is
+          # making progress. Swap for a metrics-backed probe when the
+          # archiver grows a /metrics endpoint.
+          livenessProbe:
+            exec:
+              command:
+                - pgrep
+                - -f
+                - archiver.py
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            # readOnlyRootFilesystem=true forces us to mount a writable /tmp
+            # for PyArrow / PyIceberg spill files during flush. emptyDir is
+            # fine — buffers are already in-memory and lost on restart.
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
