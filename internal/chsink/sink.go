@@ -141,24 +141,31 @@ func (s *Sink) Flush(ctx context.Context) error {
 		s.mu.Unlock()
 		return nil
 	}
-	batch := s.buf
+	// Copy into an owned slice before releasing the lock so writeBatch cannot
+	// race a concurrent Add() on the same backing array. Today the public API
+	// is single-goroutine by contract, but the mutex advertises thread-safety
+	// and the detached copy costs only one allocation per flush.
+	batch := make([]*avroschema.MovementEvent, n)
+	copy(batch, s.buf)
 	s.mu.Unlock()
 
 	if err := s.writeBatch(ctx, batch); err != nil {
+		// On failure, s.buf is untouched so the next Flush retries the same
+		// events. Because offsets were not committed, a crash here replays
+		// from Kafka with no data loss.
 		return err
 	}
 
 	s.mu.Lock()
 	// Truncate only the portion we successfully wrote; new events that
 	// arrived while writeBatch was in flight are retained.
-	s.buf = s.buf[n:]
-	// Re-slice to the original capacity so we don't leak.
-	if len(s.buf) == 0 {
-		s.buf = make([]*avroschema.MovementEvent, 0, s.batchSize)
-	} else {
-		tail := make([]*avroschema.MovementEvent, len(s.buf), s.batchSize)
-		copy(tail, s.buf)
+	if len(s.buf) > n {
+		remaining := len(s.buf) - n
+		tail := make([]*avroschema.MovementEvent, remaining, s.batchSize)
+		copy(tail, s.buf[n:])
 		s.buf = tail
+	} else {
+		s.buf = make([]*avroschema.MovementEvent, 0, s.batchSize)
 	}
 	s.mu.Unlock()
 

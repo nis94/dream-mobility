@@ -26,10 +26,13 @@ scrape_configs:
 
   - job_name: "stream-processor"
     static_configs:
+      # Only one target: the canonical PROM_PORT. Earlier revisions listed
+      # 9476/9486 for ad-hoc extra host-side replicas, but that created
+      # permanent `up==0` phantoms whenever those replicas weren't running.
+      # In kind all pods scrape through `/metrics` on 9466, reached via the
+      # kube service (future: use a PodMonitor with label selector).
       - targets:
           - "host.docker.internal:9466"
-          - "host.docker.internal:9476"
-          - "host.docker.internal:9486"
     metrics_path: /metrics
 
   - job_name: "clickhouse-sink"

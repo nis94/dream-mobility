@@ -194,6 +194,12 @@ func consumeLoop(
 				return drainAndExit(reader, sink, buffered, logger)
 			case <-time.After(fetchBackoff):
 			}
+			// runFetcher returns after pushing one error, so the previous
+			// goroutine is dead. Spawn a new one before we loop — otherwise
+			// msgCh is never written to again and the sink silently stalls
+			// while appearing healthy.
+			wg.Add(1)
+			go runFetcher(ctx, &wg, reader, msgCh, errCh, logger)
 			continue
 
 		case <-ticker.C:

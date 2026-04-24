@@ -47,7 +47,15 @@ func Load() (Config, error) {
 // RedactDSN strips the password from a URL-style DSN so it is safe to emit
 // in startup logs. The username is preserved for debug clarity. Returns
 // "<unparseable>" if the input does not parse as a URL.
+//
+// Also handles libpq key-value DSNs (`host=... password=...`): url.Parse is
+// liberal and will happily "parse" those without extracting the password,
+// leaving it in the returned string. We detect that shape and replace the
+// password value with a sentinel.
 func RedactDSN(raw string) string {
+	if strings.Contains(strings.ToLower(raw), "password=") && !strings.HasPrefix(raw, "postgres://") && !strings.HasPrefix(raw, "postgresql://") {
+		return redactKVDSN(raw)
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "<unparseable>"
@@ -56,6 +64,24 @@ func RedactDSN(raw string) string {
 		u.User = url.User(u.User.Username())
 	}
 	return u.String()
+}
+
+// redactKVDSN replaces the value of any password= assignment in a libpq-style
+// key-value DSN with "<redacted>". The parser is deliberately simple: splits
+// on whitespace and on unquoted `=`. Handles the common case; pathological
+// inputs (quoted passwords with spaces) still get redacted down to the point
+// of the first whitespace, which is the safe failure mode.
+func redactKVDSN(raw string) string {
+	parts := strings.Fields(raw)
+	for i, part := range parts {
+		if idx := strings.Index(part, "="); idx > 0 {
+			key := strings.ToLower(part[:idx])
+			if key == "password" {
+				parts[i] = "password=<redacted>"
+			}
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // parseBrokers splits a comma-separated list of host:port pairs, trims

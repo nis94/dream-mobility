@@ -17,8 +17,9 @@ Environment variables (override CLI defaults):
     ICEBERG_CATALOG_URI     Iceberg REST catalog URI (default: http://localhost:8181)
     ICEBERG_WAREHOUSE       S3 warehouse path (default: s3://lake/)
     S3_ENDPOINT             MinIO/S3 endpoint (default: http://localhost:9100)
-    S3_ACCESS_KEY           MinIO access key (default: minioadmin)
-    S3_SECRET_KEY           MinIO secret key (default: minioadmin)
+    S3_ACCESS_KEY           MinIO access key (required, no default)
+    S3_SECRET_KEY           MinIO secret key (required, no default)
+    OTEL_EXPORTER_OTLP_ENDPOINT  OTLP collector URL (default: http://localhost:4318)
 """
 
 from __future__ import annotations
@@ -36,10 +37,17 @@ from typing import Any
 
 import pyarrow as pa
 from confluent_kafka import Consumer, KafkaError, KafkaException
+from opentelemetry import propagate, trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.trace import SpanKind
 from pyiceberg.catalog import load_catalog
 from pyiceberg.exceptions import NamespaceAlreadyExistsError, NoSuchTableError
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
+from pyiceberg.table.sorting import NullOrder, SortDirection, SortField, SortOrder
 from pyiceberg.transforms import DayTransform, IdentityTransform
 from pyiceberg.types import (
     DoubleType,
@@ -49,6 +57,35 @@ from pyiceberg.types import (
 )
 
 log = logging.getLogger("archiver")
+
+
+def _init_tracer(otlp_endpoint: str) -> trace.Tracer:
+    """Initialize the OTel SDK so Kafka-carried W3C TraceContext from the Go
+    producer continues into Python spans exported to the same collector.
+
+    Called once at startup; safe to call multiple times (SDK replaces the
+    global provider).
+    """
+    resource = Resource.create({SERVICE_NAME: "archiver"})
+    provider = TracerProvider(resource=resource)
+    # `endpoint` expects the full path ending in /v1/traces; the OTel spec
+    # constant OTEL_EXPORTER_OTLP_ENDPOINT usually does NOT include that
+    # suffix, so append it here.
+    traces_url = otlp_endpoint.rstrip("/") + "/v1/traces"
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=traces_url)))
+    trace.set_tracer_provider(provider)
+    return trace.get_tracer("services.archiver")
+
+
+def _extract_parent_context(headers: list[tuple[str, bytes]] | None):
+    """Turn Kafka headers into a W3C TraceContext parent. Returns the
+    extracted Context, which start_as_current_span uses as the parent.
+    Missing / malformed headers yield a root context (new trace).
+    """
+    if not headers:
+        return None
+    carrier = {k: v.decode("utf-8", errors="replace") for k, v in headers}
+    return propagate.extract(carrier)
 
 # Arrow schema matching the Avro MovementEvent (flattened).
 ARROW_SCHEMA = pa.schema([
@@ -205,10 +242,24 @@ class IcebergArchiver:
                     source_id=2, field_id=1001, transform=IdentityTransform(), name="entity_type"
                 ),
             )
+            # Sort by event_ts within each partition so Parquet row groups are
+            # time-clustered and reader-side min/max pruning on time-range
+            # queries stays tight as the table grows. Without this, row groups
+            # within a single day-partition are written in arrival order,
+            # which for out-of-order ingest defeats pruning.
+            sort_order = SortOrder(
+                SortField(
+                    source_id=4,
+                    transform=IdentityTransform(),
+                    direction=SortDirection.ASC,
+                    null_order=NullOrder.NULLS_LAST,
+                )
+            )
             self.table = self.catalog.create_table(
                 self.table_name,
                 schema=ICEBERG_SCHEMA,
                 partition_spec=partition_spec,
+                sort_order=sort_order,
             )
             log.info("created iceberg table: %s", self.table_name)
 
@@ -233,12 +284,32 @@ class IcebergArchiver:
         self.buffer = []
         self.last_flush = time.monotonic()
 
-        table = pa.Table.from_pylist(batch, schema=ARROW_SCHEMA)
+        # In-batch dedup by event_id. Postgres and ClickHouse absorb
+        # broker-retry duplicates at the sink (PK / ReplacingMergeTree);
+        # Iceberg has no native uniqueness, so we dedup within the flush
+        # window here. This catches the common case (broker resends the
+        # same message seconds later). Cross-flush duplicates still
+        # require read-time dedup — see tools/lake-query/query.py.
+        seen: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        for event in batch:
+            event_id = event["event_id"]
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            deduped.append(event)
+        dropped = len(batch) - len(deduped)
+        if dropped > 0:
+            log.info("in-batch dedup dropped %d duplicate event_ids", dropped)
+
+        table = pa.Table.from_pylist(deduped, schema=ARROW_SCHEMA)
         self.table.append(table)
-        log.info("flushed %d events to iceberg", len(batch))
+        log.info("flushed %d events to iceberg (pre-dedup %d)", len(deduped), len(batch))
 
 
 def run(args: argparse.Namespace) -> None:
+    tracer = _init_tracer(args.otlp_endpoint)
+
     archiver = IcebergArchiver(
         catalog_uri=args.catalog_uri,
         warehouse=args.warehouse,
@@ -315,15 +386,37 @@ def run(args: argparse.Namespace) -> None:
                 backoff = min(backoff * 2, 30.0)
                 continue
 
-            event = decode_avro_event(msg.value())
-            if event is not None:
-                # add() returns True when it triggered a size-based flush.
-                flushed = archiver.add(event)
-                if not flushed and archiver.should_flush():
-                    archiver.flush()
-                    flushed = True
-                if flushed:
-                    _safe_commit(consumer)
+            # Continue the Go-side trace. The producer injects W3C
+            # TraceContext into the Kafka message's headers; we extract it
+            # here so the consumer span shows up as a child of the original
+            # ingest.event span in Jaeger.
+            parent_ctx = _extract_parent_context(msg.headers())
+            with tracer.start_as_current_span(
+                "archiver.consume",
+                context=parent_ctx,
+                kind=SpanKind.CONSUMER,
+                attributes={
+                    "messaging.system": "kafka",
+                    "messaging.destination.name": msg.topic(),
+                    "messaging.kafka.partition": msg.partition(),
+                    "messaging.kafka.offset": msg.offset(),
+                },
+            ) as span:
+                event = decode_avro_event(msg.value())
+                if event is not None:
+                    span.set_attribute("event.id", event["event_id"])
+                    span.set_attribute("entity.type", event["entity_type"])
+                    span.set_attribute("entity.id", event["entity_id"])
+                    # add() returns True when it triggered a size-based flush.
+                    flushed = archiver.add(event)
+                    if not flushed and archiver.should_flush():
+                        archiver.flush()
+                        flushed = True
+                    if flushed:
+                        _safe_commit(consumer)
+                else:
+                    span.set_attribute("error", True)
+                    span.set_attribute("error.kind", "avro_decode_failed")
             # Successful message path — reset the error backoff.
             backoff = 1.0
     finally:
@@ -381,6 +474,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--flush-size", type=int, default=10000)
     p.add_argument("--flush-interval", type=float, default=30.0)
+    p.add_argument(
+        "--otlp-endpoint",
+        default=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+        help="Base OTLP/HTTP endpoint; /v1/traces is appended automatically",
+    )
     return p.parse_args(argv)
 
 

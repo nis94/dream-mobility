@@ -46,7 +46,12 @@ register() {
       echo "OK (registered/updated)"
       ;;
     409)
-      echo "OK (already exists, compatible)"
+      # 409 from SR means "schema is incompatible with current latest", NOT
+      # "already exists" — idempotent re-registration of the same schema
+      # returns 200. Fail loudly so a breaking change cannot sneak through.
+      echo "FAILED — incompatible with existing schema (HTTP 409)"
+      echo "${body}" >&2
+      exit 1
       ;;
     *)
       echo "FAILED (HTTP ${http_code})"
@@ -54,6 +59,27 @@ register() {
       exit 1
       ;;
   esac
+}
+
+pin_compat() {
+  local subject="$1"
+  local level="$2"
+  echo -n "Pinning '${subject}' compatibility to ${level} ... "
+  local response http_code body
+  response=$(curl -sS -w '\n%{http_code}' \
+    -X PUT \
+    -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+    -d "{\"compatibility\":\"${level}\"}" \
+    "${SR_URL}/config/${subject}")
+  http_code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  if [[ "$http_code" == "200" ]]; then
+    echo "OK"
+  else
+    echo "FAILED (HTTP ${http_code})"
+    echo "${body}" >&2
+    exit 1
+  fi
 }
 
 echo "Schema Registry: ${SR_URL}"
@@ -65,6 +91,10 @@ echo
 # -----------------------------------------------------------
 
 register "movement.events-value" "${SCHEMAS_DIR}/movement_event.avsc"
+
+# Pin subject-level compat so an operator cannot accidentally relax the
+# contract by changing the SR-wide default compatibility level.
+pin_compat "movement.events-value" "BACKWARD"
 
 echo
 echo "Done. Registered subjects:"

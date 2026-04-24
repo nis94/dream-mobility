@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"time"
 
@@ -82,14 +83,10 @@ func New(ctx context.Context, brokers []string, topic, schemaRegistryURL string,
 // W3C TraceContext is injected into the outgoing message headers so the
 // consumer can continue the same trace.
 func (p *Producer) Produce(ctx context.Context, event *avro.MovementEvent) error {
-	avroBytes, err := event.Marshal()
-	if err != nil {
-		return fmt.Errorf("avro marshal: %w", err)
-	}
-
-	value := p.encodeWireFormat(avroBytes)
 	key := event.EntityType + ":" + event.EntityID
 
+	// Span covers both Avro marshal and Kafka write so marshal failures show
+	// up in traces the same way write failures do.
 	ctx, span := tracer.Start(ctx, "kafka.produce",
 		trace.WithSpanKind(trace.SpanKindProducer),
 		trace.WithAttributes(
@@ -102,6 +99,14 @@ func (p *Producer) Produce(ctx context.Context, event *avro.MovementEvent) error
 		),
 	)
 	defer span.End()
+
+	avroBytes, err := event.Marshal()
+	if err != nil {
+		span.SetStatus(codes.Error, "avro marshal")
+		span.RecordError(err)
+		return fmt.Errorf("avro marshal: %w", err)
+	}
+	value := p.encodeWireFormat(avroBytes)
 
 	headers := tracing.KafkaHeaderCarrier{}
 	otel.GetTextMapPropagator().Inject(ctx, &headers)
@@ -165,6 +170,13 @@ func registerSchema(ctx context.Context, srURL, subject string, schemaJSON []byt
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		id, retriable, err := postSchema(ctx, url, payload)
 		if err == nil {
+			// SR IDs are 32-bit unsigned on the wire; JSON decodes into a
+			// Go int which is 64-bit on all our targets. Bounds-check here
+			// so a future SR can't hand us a value that silently truncates
+			// in encodeWireFormat's uint32 cast and corrupts the prefix.
+			if id < 0 || id > math.MaxUint32 {
+				return 0, fmt.Errorf("schema registry returned out-of-range id: %d", id)
+			}
 			return id, nil
 		}
 		lastErr = err

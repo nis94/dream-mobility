@@ -22,6 +22,15 @@ would trip over.
   the wrapper pid does not kill the binary — find the real pid via
   `lsof -iTCP -sTCP:LISTEN -P | grep 94..`.
 
+## Compose port bindings are loopback-only
+
+All host-side compose port mappings are prefixed with `127.0.0.1:` so
+dev services are unreachable from the LAN. kind pods still reach them
+via `host.docker.internal`, which Docker Desktop resolves to the Mac's
+loopback interface. To enable anonymous MinIO read on the lake bucket
+(convenient for poking Iceberg files from the browser), set
+`MINIO_ANONYMOUS=1 make up` — default is off.
+
 ## Python tools need S3 creds explicitly
 
 - `services/archiver/archiver.py` and `tools/lake-query/query.py`
@@ -81,11 +90,13 @@ would trip over.
   client`).
 - **Custom metrics**: still none. `/metrics` is Go runtime + process
   only. Adding ingest/sink counters is deferred work.
-- **Traces**: the `POST /events` → Kafka → stream-processor →
-  Postgres path is instrumented end-to-end. W3C TraceContext rides
-  on Kafka message headers via the carrier in
-  `internal/tracing/kafka.go`. clickhouse-sink and archiver are not
-  yet instrumented.
+- **Traces**: instrumented end-to-end across Go AND Python services.
+  The Go ingest-api → Kafka → stream-processor → Postgres path uses
+  W3C TraceContext carried on Kafka message headers via the carrier
+  in `internal/tracing/kafka.go`. The Python archiver extracts the
+  same `traceparent` via `opentelemetry.propagate.extract()` and
+  continues the trace into Iceberg writes — one trace ID now spans
+  Go→Go→Python. clickhouse-sink is not yet instrumented.
 - Prometheus is reachable from Grafana at
   `http://dm-prometheus:9090` (the docker-network hostname), not
   `localhost`. Jaeger is reachable the same way at

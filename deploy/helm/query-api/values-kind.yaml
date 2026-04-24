@@ -4,12 +4,14 @@ image:
   pullPolicy: Never
 
 service:
-  type: NodePort
+  # ClusterIP not NodePort: the read API isn't exposed to the host by
+  # kind's extraPortMappings (only ingest-api 8080 and ArgoCD 8443 are).
+  # An allocated-but-unreachable NodePort is worse than a ClusterIP; when
+  # you need to query from the host, use:
+  #   kubectl port-forward svc/dm-query-api-query-api 8090:8090
+  type: ClusterIP
   port: 8090
   targetPort: 8090
-  # No nodePort set → kind picks one in the 30000-32767 range. We don't
-  # forward this one from host because /entities queries are read-only and
-  # can go through `kubectl port-forward` when needed.
 
 env:
   QUERY_HTTP_PORT: "8090"

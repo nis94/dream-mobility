@@ -24,8 +24,10 @@ services:
     volumes:
       - ./observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
-      - "4318:4318"    # OTLP/HTTP receiver
-      - "13133:13133"  # health_check extension
+      # Bind to loopback only — same-LAN attackers shouldn't be able to
+      # inject OTel traffic into the dev collector.
+      - "127.0.0.1:4318:4318"    # OTLP/HTTP receiver
+      - "127.0.0.1:13133:13133"  # health_check extension
     depends_on:
       jaeger:
         condition: service_healthy
@@ -39,8 +41,8 @@ services:
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
-      - "16686:16686"  # Jaeger UI
-      - "4317:4317"    # OTLP/gRPC (used by collector)
+      - "127.0.0.1:16686:16686"  # Jaeger UI
+      - "127.0.0.1:4317:4317"    # OTLP/gRPC (used by collector)
     healthcheck:
       <<: *hc-defaults
       test: ["CMD", "wget", "-qO-", "http://localhost:14269/"]
@@ -51,7 +53,7 @@ services:
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -70,7 +72,7 @@ services:
       GF_SECURITY_ADMIN_USER: "admin"
       GF_SECURITY_ADMIN_PASSWORD: "admin"
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
       - grafana-data:/var/lib/grafana
     healthcheck:

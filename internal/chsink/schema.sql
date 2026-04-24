@@ -32,7 +32,13 @@ CREATE TABLE IF NOT EXISTS mobility.raw_events (
     ingested_at DateTime64(6, 'UTC') DEFAULT now64(6)
 ) ENGINE = ReplacingMergeTree(event_ts)
 PARTITION BY toYYYYMM(event_ts)
-ORDER BY (entity_type, entity_id, event_ts, event_id);
+ORDER BY (entity_type, entity_id, event_ts, event_id)
+-- Keep raw events for 180 days. Beyond that the lake (Iceberg/MinIO) is
+-- the long-term source of truth; ClickHouse is for dashboard-latency
+-- analytics. `DELETE WHERE` runs at merge time — no background cron job.
+-- event_ts is DateTime64(6), but ClickHouse's TTL engine wants a DateTime
+-- (second resolution) — so cast. toDateTime is deterministic.
+TTL toDateTime(event_ts) + INTERVAL 180 DAY DELETE;
 
 -- Canonical read view: always reads post-merge so duplicates are collapsed.
 CREATE VIEW IF NOT EXISTS mobility.raw_events_final AS
@@ -89,3 +95,9 @@ CREATE VIEW IF NOT EXISTS mobility.events_hourly_final AS
              ELSE NULL END AS avg_speed_kmh
     FROM mobility.events_hourly
     GROUP BY entity_type, entity_id, hour;
+
+-- Idempotent TTL backfill: CREATE TABLE IF NOT EXISTS is a no-op on
+-- existing tables, so a cluster created before the TTL was added wouldn't
+-- pick up the new retention policy. This ALTER reconciles both paths —
+-- fresh installs get TTL from CREATE, old installs get it from here.
+ALTER TABLE mobility.raw_events MODIFY TTL toDateTime(event_ts) + INTERVAL 180 DAY DELETE;
