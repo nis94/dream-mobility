@@ -16,6 +16,10 @@ spec:
       labels:
         app: stream-processor
         release: {{ .Release.Name }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metricsPort | default 9466 | quote }}
+        prometheus.io/path: "/metrics"
     spec:
       securityContext:
         runAsNonRoot: true

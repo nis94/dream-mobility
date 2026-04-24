@@ -16,6 +16,13 @@ spec:
       labels:
         app: ingest-api
         release: {{ .Release.Name }}
+      annotations:
+        # Consumed by Prometheus pod discovery in kind. Each pod is a
+        # distinct scrape target, so per-replica metrics keep their
+        # identity and counters don't bounce on round-robin.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metricsPort | default 9464 | quote }}
+        prometheus.io/path: "/metrics"
     spec:
       securityContext:
         runAsNonRoot: true

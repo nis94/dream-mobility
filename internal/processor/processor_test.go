@@ -9,12 +9,13 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// TestProcessMessage_DecodeFailureIncrementsCounter verifies that a message
-// that cannot be decoded increments the decodeFailures counter and does NOT
-// return an error (so the offset will be committed past the poison pill).
-// The store is nil here — processMessage must short-circuit before touching
-// it on decode failure.
-func TestProcessMessage_DecodeFailureIncrementsCounter(t *testing.T) {
+// TestProcessMessage_DecodeFailureSwallows verifies that a message that
+// cannot be decoded does NOT return an error (so the offset is committed
+// past the poison pill). The store and metrics recorder are both nil here
+// — processMessage must short-circuit before touching either on decode
+// failure. The corresponding decode-failure metric increment is covered
+// by internal/kafkametrics unit tests.
+func TestProcessMessage_DecodeFailureSwallows(t *testing.T) {
 	p := &Processor{
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
@@ -31,14 +32,9 @@ func TestProcessMessage_DecodeFailureIncrementsCounter(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			before := p.decodeFailures.Load()
 			err := p.processMessage(context.Background(), kafka.Message{Value: tc.data})
 			if err != nil {
 				t.Fatalf("processMessage returned error %v; should swallow decode failures", err)
-			}
-			after := p.decodeFailures.Load()
-			if after != before+1 {
-				t.Errorf("decodeFailures = %d, want %d (before=%d)", after, before+1, before)
 			}
 		})
 	}

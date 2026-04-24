@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nis94/dream-mobility/internal/config"
+	"github.com/nis94/dream-mobility/internal/kafkametrics"
 	otelinit "github.com/nis94/dream-mobility/internal/otel"
 	"github.com/nis94/dream-mobility/internal/processor"
 )
@@ -65,7 +66,8 @@ func run(logger *slog.Logger) error {
 	defer store.Close()
 	logger.Info("postgres connected, migrations applied")
 
-	proc := processor.New(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroupID, store, logger)
+	metrics := kafkametrics.New()
+	proc := processor.New(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroupID, store, metrics, logger)
 	defer func() {
 		if err := proc.Close(); err != nil {
 			logger.Error("processor close failed", "err", err)

@@ -14,12 +14,12 @@ import (
 	"os/signal"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/nis94/dream-mobility/internal/chsink"
 	"github.com/nis94/dream-mobility/internal/config"
+	"github.com/nis94/dream-mobility/internal/kafkametrics"
 	otelinit "github.com/nis94/dream-mobility/internal/otel"
 	"github.com/nis94/dream-mobility/internal/processor"
 	"github.com/segmentio/kafka-go"
@@ -29,12 +29,12 @@ import (
 // CLICKHOUSE_BATCH_TIMEOUT, CLICKHOUSE_BUFFER_MAX) so deploys can tune
 // without a code change.
 var (
-	fetchBackoff   = 500 * time.Millisecond
-	commitTimeout  = 5 * time.Second
-	statsInterval  = 30 * time.Second
-	flushOnClose   = 10 * time.Second
-	serviceName    = "clickhouse-sink"
-	defaultGroupID = "mobility-clickhouse"
+	fetchBackoff    = 500 * time.Millisecond
+	commitTimeout   = 5 * time.Second
+	metricsInterval = 5 * time.Second
+	flushOnClose    = 10 * time.Second
+	serviceName     = "clickhouse-sink"
+	defaultGroupID  = "mobility-clickhouse"
 )
 
 const (
@@ -142,11 +142,14 @@ func consumeLoop(
 	reader := processor.NewReader(cfg.KafkaBrokers, cfg.KafkaTopic, groupID, logger)
 	defer func() { _ = reader.Close() }()
 
-	var decodeFailures atomic.Uint64
+	metrics := kafkametrics.New()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go runStatsSampler(ctx, &wg, reader, &decodeFailures, logger)
+	go func() {
+		defer wg.Done()
+		metrics.Sample(ctx, reader, metricsInterval)
+	}()
 
 	msgCh := make(chan kafka.Message, opts.batchSize)
 	errCh := make(chan error, 1)
@@ -210,7 +213,7 @@ func consumeLoop(
 		case msg := <-msgCase:
 			event, err := processor.DecodeMovementEvent(msg.Value)
 			if err != nil {
-				decodeFailures.Add(1)
+				metrics.IncDecodeFailure()
 				logger.Warn("decode failed, skipping",
 					"partition", msg.Partition, "offset", msg.Offset,
 					"payload_len", len(msg.Value), "err", err)
@@ -283,26 +286,6 @@ func runFetcher(ctx context.Context, wg *sync.WaitGroup, reader *kafka.Reader, m
 		case msgCh <- msg:
 		case <-ctx.Done():
 			return
-		}
-	}
-}
-
-func runStatsSampler(ctx context.Context, wg *sync.WaitGroup, reader *kafka.Reader, decodeFailures *atomic.Uint64, logger *slog.Logger) {
-	defer wg.Done()
-	t := time.NewTicker(statsInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			stats := reader.Stats()
-			logger.Info("clickhouse-sink stats",
-				"decode_failures", decodeFailures.Load(),
-				"lag", stats.Lag,
-				"messages", stats.Messages,
-				"bytes", stats.Bytes,
-			)
 		}
 	}
 }

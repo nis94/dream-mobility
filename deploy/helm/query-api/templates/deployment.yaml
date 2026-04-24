@@ -16,6 +16,10 @@ spec:
       labels:
         app: query-api
         release: {{ .Release.Name }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metricsPort | default 9465 | quote }}
+        prometheus.io/path: "/metrics"
     spec:
       securityContext:
         runAsNonRoot: true

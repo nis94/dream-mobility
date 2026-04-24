@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sync/atomic"
 	"time"
 
+	"github.com/nis94/dream-mobility/internal/kafkametrics"
 	"github.com/nis94/dream-mobility/internal/tracing"
 	"github.com/segmentio/kafka-go"
 	"go.opentelemetry.io/otel"
@@ -27,30 +27,25 @@ const commitTimeout = 5 * time.Second
 // Without it, a broker outage causes a CPU-pinning retry loop and log flood.
 const fetchBackoff = 500 * time.Millisecond
 
-// statsInterval is how often the sampler goroutine emits a structured log
-// line with consumer lag and the decode-failures counter.
-const statsInterval = 30 * time.Second
+// metricsInterval is how often the sampler goroutine drains Reader.Stats()
+// into Prometheus metrics. Shorter than Prometheus's scrape interval so
+// every scrape sees fresh data and no sub-interval deltas are dropped.
+const metricsInterval = 5 * time.Second
 
 // Processor reads from Kafka, decodes Avro events, and writes them to Postgres.
 // It uses explicit offset commits (FetchMessage + CommitMessages) so the offset
 // is advanced only after the DB transaction succeeds — at-least-once semantics
 // with idempotent Postgres writes (ON CONFLICT).
 type Processor struct {
-	reader *kafka.Reader
-	store  *Store
-	logger *slog.Logger
-
-	// decodeFailures counts messages that could not be parsed as the expected
-	// Avro record (bad magic byte, truncated payload, schema mismatch). These
-	// are committed past — retrying a corrupted message is pointless — so the
-	// counter is the only signal that they occurred. Exposed as read-only in
-	// the sampler log line; writers use atomic.Add.
-	decodeFailures atomic.Uint64
+	reader  *kafka.Reader
+	store   *Store
+	logger  *slog.Logger
+	metrics *kafkametrics.Recorder
 }
 
 // New creates a Processor. The Kafka reader is configured for manual commit
 // (no auto-commit) so offsets advance only on successful DB writes.
-func New(brokers []string, topic, groupID string, store *Store, logger *slog.Logger) *Processor {
+func New(brokers []string, topic, groupID string, store *Store, metrics *kafkametrics.Recorder, logger *slog.Logger) *Processor {
 	r := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        brokers,
 		Topic:          topic,
@@ -63,7 +58,7 @@ func New(brokers []string, topic, groupID string, store *Store, logger *slog.Log
 		ErrorLogger:    kafkaLogger{logger: logger, level: slog.LevelError},
 	})
 
-	return &Processor{reader: r, store: store, logger: logger}
+	return &Processor{reader: r, store: store, logger: logger, metrics: metrics}
 }
 
 // Run reads messages in a loop until ctx is cancelled. Each message is decoded,
@@ -71,15 +66,15 @@ func New(brokers []string, topic, groupID string, store *Store, logger *slog.Log
 // messages are logged but do not stop the loop (the message is retried on
 // the next consumer restart because the offset was not committed).
 //
-// A background goroutine samples Kafka reader stats every statsInterval and
-// emits a structured "processor stats" log line with lag and decode-failure
-// count.
+// A background goroutine drains Reader.Stats() into the Prometheus Recorder
+// every metricsInterval. No "processor stats" log line is emitted — the
+// signal belongs in metrics, not logs.
 func (p *Processor) Run(ctx context.Context) error {
 	p.logger.Info("processor starting", "topic", p.reader.Config().Topic, "group", p.reader.Config().GroupID)
 
-	samplerCtx, cancelSampler := context.WithCancel(ctx)
-	defer cancelSampler()
-	go p.runStatsSampler(samplerCtx)
+	if p.metrics != nil {
+		go p.metrics.Sample(ctx, p.reader, metricsInterval)
+	}
 
 	for {
 		msg, err := p.reader.FetchMessage(ctx)
@@ -120,28 +115,6 @@ func (p *Processor) Run(ctx context.Context) error {
 	}
 }
 
-// runStatsSampler periodically logs consumer lag and the decode-failure
-// counter. Reader.Stats() resets some counters on read, so this MUST be the
-// only goroutine calling it.
-func (p *Processor) runStatsSampler(ctx context.Context) {
-	t := time.NewTicker(statsInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			stats := p.reader.Stats()
-			p.logger.Info("processor stats",
-				"decode_failures", p.decodeFailures.Load(),
-				"lag", stats.Lag,
-				"messages", stats.Messages,
-				"bytes", stats.Bytes,
-			)
-		}
-	}
-}
-
 func (p *Processor) processMessage(ctx context.Context, msg kafka.Message) error {
 	// Continue the producer's trace if a traceparent was carried on the
 	// message. Missing headers → root span (useful for tools that write
@@ -162,7 +135,9 @@ func (p *Processor) processMessage(ctx context.Context, msg kafka.Message) error
 
 	event, err := decodeMovementEvent(msg.Value)
 	if err != nil {
-		p.decodeFailures.Add(1)
+		if p.metrics != nil {
+			p.metrics.IncDecodeFailure()
+		}
 		span.SetStatus(codes.Error, "decode failed")
 		span.RecordError(err)
 		p.logger.Warn("decode failed, skipping message",

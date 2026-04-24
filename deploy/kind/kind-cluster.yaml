@@ -1,13 +1,17 @@
 # kind cluster spec for the Dream Mobility dev loop.
 #
-# Single-node cluster. Two host ports are forwarded into the node:
-#   8080  → NodePort 30080 (ingest-api)   — for host-side generator / curl
-#   8443  → NodePort 30443 (argocd UI)    — ArgoCD server over TLS
+# Single-node cluster. Three host ports are forwarded into the node:
+#   8080  → NodePort 30080 (ingest-api)       — host-side generator / curl
+#   8443  → NodePort 30443 (argocd UI)        — ArgoCD server over TLS
+#   9091  → NodePort 30091 (prometheus)       — compose Grafana scrapes this
 #
-# Infra (Kafka, Postgres, ClickHouse, Schema Registry, MinIO, OTel, Jaeger,
-# Grafana, Prometheus) stays on docker-compose. In-cluster workloads reach
-# it via host.docker.internal, which Docker Desktop exposes to kind nodes
-# by default.
+# Infra that's NOT metrics (Kafka, Postgres, ClickHouse, Schema Registry,
+# MinIO, OTel, Jaeger, Grafana) stays on docker-compose. In-cluster
+# workloads reach it via host.docker.internal.
+#
+# Prometheus itself lives IN kind — it needs pod-level service discovery
+# to scrape all N replicas of each workload (which a load-balanced Service
+# in compose Prometheus cannot provide without breaking counter semantics).
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: dream-mobility
@@ -19,4 +23,7 @@ nodes:
         protocol: TCP
       - containerPort: 30443
         hostPort: 8443
+        protocol: TCP
+      - containerPort: 30091
+        hostPort: 9091
         protocol: TCP
