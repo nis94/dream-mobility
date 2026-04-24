@@ -84,7 +84,7 @@ sequenceDiagram
     par independent consumer groups
         K->>P: FetchMessage(mobility-postgres)
         P->>P: decode SR wire format
-        P->>PG: BEGIN; INSERT raw_events ON CONFLICT; UPSERT entity_positions WHERE event_ts>
+        P->>PG: BEGIN; INSERT raw_events ON CONFLICT; UPSERT entity_positions (timestamp-gated)
         PG-->>P: committed
         P->>K: CommitMessages (detached 5s ctx)
     and
@@ -105,7 +105,7 @@ sequenceDiagram
     Q->>PG: point read entity_positions
     Q-->>C: 200 {lat, lon, event_ts, last_event_id}
     C->>Q: GET /entities/vehicle/v7/events?limit=50
-    Q->>PG: row-wise keyset (event_ts, event_id)< cursor
+    Q->>PG: row-wise keyset before cursor (event_ts, event_id)
     Q-->>C: 200 {events[], next_cursor}
 ```
 
