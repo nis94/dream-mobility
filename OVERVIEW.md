@@ -67,8 +67,8 @@ document explains each choice.
 
 ## 3. The services we wrote
 
-We split the work into six processes — four Go, two Python. Each one
-owns exactly one thing.
+The pipeline has six long-running services — four Go and two Python —
+plus two Python CLI helpers. Each one owns exactly one thing.
 
 ### Go services (four, under `cmd/`)
 
@@ -90,10 +90,12 @@ incoming events and flushes in batches (tuneable by env), because
 ClickHouse hates single-row inserts. Offsets commit per batch.
 
 **`query-api`** — the read-side HTTP service. Reads Postgres only.
-Exposes `GET /entities/{type}/{id}/position` (single point read) and
-`/events` (paginated reverse-chronological history). The pagination
-cursor is composite `(observed_at, event_id)` so ties within the same
-microsecond don't duplicate rows across pages.
+Exposes `GET /aircraft/{icao24}` (last-known state), `/aircraft/{icao24}/track`
+(paginated reverse-chronological observations), and `/flights/active`
+(active aircraft in the last 5 minutes, optionally filtered by
+`origin_country`). The pagination cursor is composite
+`(observed_at, event_id)` so ties within the same microsecond don't
+duplicate rows across pages.
 
 All four are plain stdlib-ish Go — the only real frameworks are
 `chi` for routing (small, idiomatic, standard) and `pgx` for
@@ -102,20 +104,30 @@ container, no magic.
 
 ### Python services (two)
 
+**`services/opensky-ingest`** — the live data producer. Polls
+[OpenSky Network](https://openskynetwork.github.io/opensky-api/)'s
+`/api/states/all` every 300 seconds (anonymous tier safe), normalizes
+each state vector into the FlightTelemetry record, encodes it as Avro
+with the SR wire-format prefix, and produces direct to Kafka keyed by
+`icao24`. Bypasses ingest-api on purpose — a pull-based source has no
+reason to round-trip through HTTP.
+
 **`services/archiver`** — the Iceberg writer, written in Python because
 **PyIceberg** is dramatically more mature than any Go Iceberg client.
 Reads from Kafka (same topic, its own consumer group), buffers events
 in memory, and flushes them as Parquet files into a partitioned
 Iceberg table on MinIO. Uses the Iceberg REST catalog for metadata.
 
-**`tools/generator`** — synthetic event producer used for dev/load
-testing. Emits random movement events with injectable duplicate and
-out-of-order ratios, so we can verify dedupe and the position upsert
-guard actually work.
+### Python CLI tools (two)
+
+**`tools/generator`** — synthetic event producer used for chaos
+testing. Emits random aviation events with injectable duplicate and
+out-of-order ratios, so we can verify dedupe and the
+timestamp-gated upsert guard actually work. Run on demand against the
+ingest-api; not a long-running service.
 
 **`tools/lake-query`** — a DuckDB-over-Iceberg CLI for running ad-hoc
 SQL against the lake. Takes one query, runs it locally, returns rows.
-Not a long-running service, just a convenience.
 
 ### Why this split of languages
 
@@ -219,35 +231,48 @@ are its sweet spot.
 
 ### ClickHouse — dashboards and analytics
 
-Role: range scans, aggregates, "average speed per entity per hour
-over the last 24h", "top 10 entities by distance today".
+Role: range scans, aggregates, "active aircraft per country per hour",
+"top airlines by climb/descent rate today", "airspace density over
+Europe in the last 5 minutes."
 
 ClickHouse is a columnar OLAP database. It stores data in sorted,
 compressed column files, so scanning 10 million rows to sum one
 column is ~10× cheaper than in a row store like Postgres.
 
-Two design choices worth calling out:
+The schema (in `internal/chsink/schema.sql`) has one raw table plus
+three materialized rollups, each answering a different operational
+question:
 
-- **`ReplacingMergeTree` with `observed_at` as the version** on the raw
-  events table. This lets us ingest at-least-once safely: a
-  re-delivered duplicate `event_id` is collapsed by a background
-  merge. Read queries use `FINAL` (via the `flight_telemetry_final` view)
-  so callers never see the pre-merge duplicates.
-- **`AggregatingMergeTree` materialized view** `events_hourly_mv`
-  that rolls raw events into hourly buckets at write time using
-  `uniqExactState(event_id)`. Critically, this is *not* `count()`
-  — if we used `count()`, re-delivered events would double-count
-  until the merge kicks in. `uniqExactState` is mathematically
-  dedupe-safe because it stores hash sets, not integers.
+- **`flight.telemetry`** — `ReplacingMergeTree(observed_at)` over the
+  raw events. Re-delivered duplicate `event_id` is collapsed by a
+  background merge. Read queries use `FINAL` (via the
+  `flight.telemetry_final` view) so callers never see pre-merge
+  duplicates. 180-day TTL.
+- **`flight.telemetry_hourly_by_country`** — `AggregatingMergeTree`
+  materialized from the raw table at write time. One row per
+  `(origin_country, hour)` with `uniqExactState(icao24)` plus
+  `SimpleAggregateFunction(sum, ...)` for velocity / altitude
+  averages, and counts for climbing / descending / cruising /
+  on-ground / emergency-squawk events.
+- **`flight.telemetry_hourly_by_airline`** — same shape but keyed on
+  the first 3 chars of `callsign` (the ICAO airline code). Powers
+  per-operator rollups.
+- **`flight.airspace_grid_5min`** — geographic density heatmap. 0.25°
+  lat/lon cells, 5-minute buckets, airborne aircraft only.
+  `uniqExactState(icao24)` per cell. 30-day TTL.
+
+`uniqExactState` instead of `count()` is the load-bearing choice:
+re-delivered events would double-count under `count()` until the
+ReplacingMergeTree merge kicks in. `uniqExact` stores hash sets, not
+integers, so duplicates collapse mathematically at read time.
 
 Why ClickHouse and not, say, DuckDB, Snowflake, or Druid?
 - **Self-hostable, free, single-node friendly**. Perfect for local
   dev and still scales linearly across a real cluster.
 - **SQL that doesn't lie** to you about dedupe semantics under
   at-least-once ingestion, via the `uniqExact` family.
-- **Merge trees compose**. You can add another materialized view
-  for daily rollups on top of `events_hourly` and it's just more
-  SQL.
+- **Merge trees compose**. Adding another rollup (e.g. a daily
+  summary on top of one of the hourly tables) is just more SQL.
 
 ### Iceberg on MinIO — the long-term lake
 
@@ -406,10 +431,11 @@ Compose is the right tool for this because:
 ### kind — the application layer
 
 `deploy/kind/kind-cluster.yaml` + `scripts/kind-up.sh` brings up a
-**single-node Kubernetes cluster** that runs only the four Go
-services. Our services image-pull from the local Docker daemon (via
-`kind load docker-image`), deploy via Helm charts
-(`deploy/helm/<service>/`), and reach the compose infra over
+**single-node Kubernetes cluster** that runs the six pipeline services
+(four Go, two Python) plus a daily Postgres-retention CronJob and an
+in-cluster Prometheus + ArgoCD. Service images are pulled from the
+local Docker daemon (via `kind load docker-image`), deployed via Helm
+charts (`deploy/helm/<service>/`), and reach the compose infra over
 `host.docker.internal`.
 
 This split is not production-shaped — in production everything would
@@ -449,11 +475,13 @@ would be even smaller but distroless gives us CA certs for TLS.
 
 ### Helm charts
 
-`deploy/helm/<service>/` — one chart per service. Each chart has a
-single `Deployment` and (for ingest-api and query-api) a `Service`.
-Values are split between `values.yaml` (defaults that assume
-in-cluster infra) and `values-kind.yaml` (the local override that
-points at `host.docker.internal`).
+`deploy/helm/<chart>/` — one chart per pipeline service plus one
+infra chart (`postgres-retention`, see §10). Each service chart has
+a single `Deployment` and (for ingest-api and query-api) a `Service`;
+the infra chart ships a `CronJob` only. Values are split between
+`values.yaml` (defaults that assume in-cluster infra) and
+`values-kind.yaml` (the local override that points at
+`host.docker.internal`).
 
 Why Helm and not raw `kubectl apply -f`? Because:
 - **Template variables**. Every chart needs to vary image tag,
@@ -463,20 +491,20 @@ Why Helm and not raw `kubectl apply -f`? Because:
 - **It's the universal language**. Every open-source k8s component
   ships a Helm chart. ArgoCD speaks Helm natively.
 
-We specifically avoided a mega-chart that deploys all four services
-at once. One chart per service means one rollback unit, one
-changelog, one set of values — matches the micro-service deploy
-boundary.
+We specifically avoided a mega-chart that deploys everything at once.
+One chart per service means one rollback unit, one changelog, one set
+of values — matches the micro-service deploy boundary.
 
-### ArgoCD (scaffolded, blocked on repo visibility)
+### ArgoCD
 
-ArgoCD is installed in the kind cluster and its manifests live at
+ArgoCD runs in the kind cluster and its manifests live at
 `deploy/argocd/`:
 - `root.yaml` — the "app-of-apps" Application; apply this once and
   ArgoCD picks up every file under `deploy/argocd/apps/`
   automatically.
-- `deploy/argocd/apps/<service>.yaml` — one Application per service,
-  pointing at its Helm chart path in this repo on `main`.
+- `deploy/argocd/apps/<chart>.yaml` — one Application per chart
+  (six pipeline services + one CronJob = seven Applications),
+  pointing at the Helm chart path in this repo on `main`.
 
 The GitOps loop is: push to `main` → ArgoCD detects the commit
 within ~3 min → reconciles the cluster to match. `automated.prune`
@@ -492,9 +520,10 @@ Why ArgoCD and not Flux or plain scripts?
 - **Industry standard**: ArgoCD is the most common answer for
   GitOps in the Kubernetes world.
 
-Currently blocked: the repo is private on GitHub, and ArgoCD needs a
-read credential to clone it. Resolving that (make public, PAT, or
-SSH deploy key) is the next step.
+Local access (kind doesn't ship a default ingress): port-forward the
+ArgoCD server with `kubectl -n argocd port-forward svc/argo-cd-argocd-server 8443:80`,
+then open <http://localhost:8443>. Initial admin password lives in
+the `argocd-initial-admin-secret` Secret.
 
 ---
 
@@ -542,9 +571,29 @@ it's "we've taken the free 90% and clearly flagged the paid 10%."
 
 ---
 
-## 10. What's deliberately half-built
+## 10. Retention and what's deliberately half-built
 
-This is a learning project. A full production version would add:
+### Retention is layered across the three stores
+
+Each store carries its own retention policy, sized to its role:
+
+- **Postgres `flight_telemetry`** — pruned by a daily K8s CronJob
+  (`deploy/helm/postgres-retention/`) that runs at 03:00 UTC and
+  DELETEs rows older than 7 days. Postgres has no native TTL, so
+  this fills the gap. `aircraft_state` is intentionally *not*
+  pruned — it's the latest-known-state cache, naturally bounded to
+  the ~10k aircraft active globally at any moment.
+- **ClickHouse `flight.telemetry`** — 180-day TTL declared in the
+  table DDL; the MergeTree engine drops expired rows during normal
+  background merges. Hourly rollups are TTL'd at 90 days, the
+  airspace grid at 30 days.
+- **Iceberg `flight.telemetry`** — no TTL. The lake is the
+  long-term source of truth.
+- **Kafka topic** — 48-hour log retention (compose env). Sinks have
+  always absorbed older events into one of the three stores by
+  the time Kafka prunes.
+
+### What a full production version would still add
 
 - **Real auth on `ingest-api` and `query-api`** — JWT or API key at
   an ingress layer.
