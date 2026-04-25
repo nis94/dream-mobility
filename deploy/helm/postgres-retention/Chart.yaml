@@ -1,0 +1,6 @@
+apiVersion: v2
+name: postgres-retention
+description: Daily K8s CronJob that DELETEs flight_telemetry rows older than RETENTION_DAYS. aircraft_state is naturally bounded and not pruned.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
