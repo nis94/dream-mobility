@@ -148,7 +148,7 @@
       "id": 3,
       "targets": [
         {
-          "expr": "rate(process_cpu_seconds_total{job=\"kubernetes-pods\"}[1m])",
+          "expr": "rate(process_cpu_seconds_total{job=\"kubernetes-pods\"}[5m])",
           "legendFormat": "{{app}} — {{instance}}"
         }
       ],
@@ -174,7 +174,7 @@
       "id": 4,
       "targets": [
         {
-          "expr": "rate(go_memstats_alloc_bytes_total{job=\"kubernetes-pods\"}[1m]) / 1024 / 1024",
+          "expr": "rate(go_memstats_alloc_bytes_total{job=\"kubernetes-pods\"}[5m]) / 1024 / 1024",
           "legendFormat": "{{app}} — {{instance}}"
         }
       ],
