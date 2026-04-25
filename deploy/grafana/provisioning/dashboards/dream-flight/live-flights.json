@@ -7,10 +7,53 @@
   "refresh": "30s",
   "time": { "from": "now-1h", "to": "now" },
   "tags": ["dream-flight", "aviation"],
+  "templating": {
+    "list": [
+      {
+        "name": "origin",
+        "label": "Origin country",
+        "type": "query",
+        "datasource": { "type": "postgres", "uid": "postgres" },
+        "query": "SELECT DISTINCT origin_country FROM aircraft_state WHERE observed_at >= now() - interval '1 hour' ORDER BY 1",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all", "selected": false },
+        "sort": 1
+      },
+      {
+        "name": "airline",
+        "label": "Airline (callsign prefix)",
+        "type": "query",
+        "datasource": { "type": "postgres", "uid": "postgres" },
+        "query": "SELECT DISTINCT substring(last_callsign, 1, 3) AS prefix FROM aircraft_state WHERE last_callsign IS NOT NULL AND length(trim(last_callsign)) >= 3 AND observed_at >= now() - interval '1 hour' ORDER BY 1",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all", "selected": false },
+        "sort": 1
+      },
+      {
+        "name": "ground",
+        "label": "On-ground state",
+        "type": "custom",
+        "query": "All : .*, Airborne only : false, On ground only : true",
+        "current": { "text": "All", "value": ".*", "selected": true },
+        "options": [
+          { "text": "All", "value": ".*", "selected": true },
+          { "text": "Airborne only", "value": "false", "selected": false },
+          { "text": "On ground only", "value": "true", "selected": false }
+        ]
+      }
+    ]
+  },
   "panels": [
     {
       "id": 1,
       "title": "Active aircraft (last 5m)",
+      "description": "Count of aircraft_state rows whose latest observation is within the last 5 minutes, filtered by the dashboard variables.",
       "type": "stat",
       "datasource": { "type": "postgres", "uid": "postgres" },
       "gridPos": { "x": 0, "y": 0, "w": 6, "h": 5 },
@@ -23,13 +66,14 @@
         {
           "refId": "A",
           "format": "table",
-          "rawSql": "SELECT count(*) AS active FROM aircraft_state WHERE observed_at >= now() - interval '5 minutes'"
+          "rawSql": "SELECT count(*) AS active FROM aircraft_state WHERE observed_at >= now() - interval '5 minutes' AND origin_country ~ '${origin:regex}' AND coalesce(substring(last_callsign,1,3),'') ~ '${airline:regex}' AND on_ground::text ~ '${ground:raw}'"
         }
       ]
     },
     {
       "id": 2,
       "title": "Airborne",
+      "description": "Aircraft matching the filters whose last observation said they're flying. Independent of the on-ground filter so the breakdown is always shown.",
       "type": "stat",
       "datasource": { "type": "postgres", "uid": "postgres" },
       "gridPos": { "x": 6, "y": 0, "w": 6, "h": 5 },
@@ -42,13 +86,14 @@
         {
           "refId": "A",
           "format": "table",
-          "rawSql": "SELECT count(*) FILTER (WHERE NOT on_ground) AS airborne FROM aircraft_state WHERE observed_at >= now() - interval '5 minutes'"
+          "rawSql": "SELECT count(*) FILTER (WHERE NOT on_ground) AS airborne FROM aircraft_state WHERE observed_at >= now() - interval '5 minutes' AND origin_country ~ '${origin:regex}' AND coalesce(substring(last_callsign,1,3),'') ~ '${airline:regex}'"
         }
       ]
     },
     {
       "id": 3,
       "title": "On ground",
+      "description": "Aircraft matching the filters that are currently on the ground. Independent of the on-ground filter so the breakdown is always shown.",
       "type": "stat",
       "datasource": { "type": "postgres", "uid": "postgres" },
       "gridPos": { "x": 12, "y": 0, "w": 6, "h": 5 },
@@ -61,13 +106,14 @@
         {
           "refId": "A",
           "format": "table",
-          "rawSql": "SELECT count(*) FILTER (WHERE on_ground) AS on_ground FROM aircraft_state WHERE observed_at >= now() - interval '5 minutes'"
+          "rawSql": "SELECT count(*) FILTER (WHERE on_ground) AS on_ground FROM aircraft_state WHERE observed_at >= now() - interval '5 minutes' AND origin_country ~ '${origin:regex}' AND coalesce(substring(last_callsign,1,3),'') ~ '${airline:regex}'"
         }
       ]
     },
     {
       "id": 4,
       "title": "Avg cruise altitude (m)",
+      "description": "Mean barometric altitude of currently airborne aircraft matching the filters.",
       "type": "stat",
       "datasource": { "type": "postgres", "uid": "postgres" },
       "gridPos": { "x": 18, "y": 0, "w": 6, "h": 5 },
@@ -80,13 +126,14 @@
         {
           "refId": "A",
           "format": "table",
-          "rawSql": "SELECT round(avg(baro_altitude_m)::numeric, 0) AS avg_alt FROM aircraft_state WHERE NOT on_ground AND baro_altitude_m IS NOT NULL AND observed_at >= now() - interval '5 minutes'"
+          "rawSql": "SELECT round(avg(baro_altitude_m)::numeric, 0) AS avg_alt FROM aircraft_state WHERE NOT on_ground AND baro_altitude_m IS NOT NULL AND observed_at >= now() - interval '5 minutes' AND origin_country ~ '${origin:regex}' AND coalesce(substring(last_callsign,1,3),'') ~ '${airline:regex}'"
         }
       ]
     },
     {
       "id": 5,
       "title": "Top 10 origin countries (active last 5m)",
+      "description": "Country leaderboard of active aircraft. Reflects the airline + on-ground filters; origin filter is intentionally not applied so the panel can be used to discover countries to filter by.",
       "type": "barchart",
       "datasource": { "type": "postgres", "uid": "postgres" },
       "gridPos": { "x": 0, "y": 5, "w": 12, "h": 9 },
@@ -99,13 +146,14 @@
         {
           "refId": "A",
           "format": "table",
-          "rawSql": "SELECT origin_country, count(*)::int AS aircraft FROM aircraft_state WHERE observed_at >= now() - interval '5 minutes' GROUP BY origin_country ORDER BY aircraft DESC LIMIT 10"
+          "rawSql": "SELECT origin_country, count(*)::int AS aircraft FROM aircraft_state WHERE observed_at >= now() - interval '5 minutes' AND coalesce(substring(last_callsign,1,3),'') ~ '${airline:regex}' AND on_ground::text ~ '${ground:raw}' GROUP BY origin_country ORDER BY aircraft DESC LIMIT 10"
         }
       ]
     },
     {
       "id": 6,
       "title": "Aircraft observed (last 1h, by minute)",
+      "description": "Distinct icao24 per minute over the last hour, filtered by the dashboard variables. Spikes correspond to OpenSky polls (every 300s).",
       "type": "timeseries",
       "datasource": { "type": "postgres", "uid": "postgres" },
       "gridPos": { "x": 12, "y": 5, "w": 12, "h": 9 },
@@ -114,13 +162,14 @@
         {
           "refId": "A",
           "format": "time_series",
-          "rawSql": "SELECT date_trunc('minute', observed_at) AS time, count(DISTINCT icao24) AS aircraft FROM flight_telemetry WHERE observed_at >= now() - interval '1 hour' GROUP BY 1 ORDER BY 1"
+          "rawSql": "SELECT date_trunc('minute', observed_at) AS time, count(DISTINCT icao24) AS aircraft FROM flight_telemetry WHERE observed_at >= now() - interval '1 hour' AND origin_country ~ '${origin:regex}' AND coalesce(substring(callsign,1,3),'') ~ '${airline:regex}' AND on_ground::text ~ '${ground:raw}' GROUP BY 1 ORDER BY 1"
         }
       ]
     },
     {
       "id": 7,
       "title": "Recent emergency squawks (7500/7600/7700)",
+      "description": "Observations where the squawk code is one of three special emergency values: 7500 (hijack), 7600 (radio failure), 7700 (general emergency). Reflects origin + airline filters; on-ground filter is not applied — emergency squawks are surfaced regardless of state.",
       "type": "table",
       "datasource": { "type": "postgres", "uid": "postgres" },
       "gridPos": { "x": 0, "y": 14, "w": 24, "h": 8 },
@@ -130,7 +179,7 @@
         {
           "refId": "A",
           "format": "table",
-          "rawSql": "SELECT observed_at, icao24, callsign, origin_country, squawk, lat, lon, baro_altitude_m FROM flight_telemetry WHERE squawk IN ('7500','7600','7700') AND observed_at >= now() - interval '6 hours' ORDER BY observed_at DESC LIMIT 50"
+          "rawSql": "SELECT observed_at, icao24, callsign, origin_country, squawk, lat, lon, baro_altitude_m FROM flight_telemetry WHERE squawk IN ('7500','7600','7700') AND observed_at >= now() - interval '6 hours' AND origin_country ~ '${origin:regex}' AND coalesce(substring(callsign,1,3),'') ~ '${airline:regex}' ORDER BY observed_at DESC LIMIT 50"
         }
       ]
     }
