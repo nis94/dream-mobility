@@ -1,0 +1,6 @@
+# values-kind.yaml — overrides for kind cluster pointing at the
+# docker-compose Postgres on the host.
+
+env:
+  RETENTION_DAYS: "7"
+  POSTGRES_DSN: "postgres://postgres:postgres@host.docker.internal:5432/flight?sslmode=disable"

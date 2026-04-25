@@ -1,0 +1,87 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-postgres-retention
+  labels:
+    app: postgres-retention
+    release: {{ .Release.Name }}
+spec:
+  schedule: {{ .Values.schedule | quote }}
+  concurrencyPolicy: {{ .Values.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.failedJobsHistoryLimit }}
+  startingDeadlineSeconds: {{ .Values.startingDeadlineSeconds }}
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: {{ .Values.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            app: postgres-retention
+            release: {{ .Release.Name }}
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            # postgres:16-alpine ships a non-root postgres user (uid 70).
+            # Reusing it avoids the readOnlyRootFilesystem dance to make
+            # /var/lib/postgresql writable for ad-hoc psql temp state.
+            runAsNonRoot: true
+            runAsUser: 70
+            runAsGroup: 70
+            fsGroup: 70
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: postgres-retention
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              env:
+                {{- range $key, $value := .Values.env }}
+                {{- if and $.Values.postgresSecret (eq $key "POSTGRES_DSN") }}
+                {{- /* Skip inline DSN when a Secret reference is provided. */ -}}
+                {{- else }}
+                - name: {{ $key }}
+                  value: {{ $value | quote }}
+                {{- end }}
+                {{- end }}
+                {{- if .Values.postgresSecret }}
+                - name: POSTGRES_DSN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.postgresSecret.name }}
+                      key: {{ .Values.postgresSecret.key | default "dsn" }}
+                {{- end }}
+              # psql's default DELETE output is `DELETE <n>` to stdout — the
+              # row count lands in CronJob logs without extra plumbing.
+              # ON_ERROR_STOP=1 turns any SQL failure into a non-zero exit
+              # so the Job is marked Failed instead of "Completed but did
+              # nothing." RETENTION_DAYS is sanitized to digits-only at the
+              # entry of the script, so the inline shell substitution into
+              # the SQL string is safe — the chart values are the only
+              # source of this var, never untrusted input.
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  case "${RETENTION_DAYS}" in
+                    *[!0-9]*|"") echo "RETENTION_DAYS must be a positive integer, got: ${RETENTION_DAYS}"; exit 2 ;;
+                  esac
+                  echo "retention: deleting flight_telemetry rows older than ${RETENTION_DAYS} days"
+                  psql "${POSTGRES_DSN}" \
+                    -v ON_ERROR_STOP=1 \
+                    -c "DELETE FROM flight_telemetry WHERE observed_at < now() - make_interval(days => ${RETENTION_DAYS})"
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+          volumes:
+            - name: tmp
+              emptyDir: {}

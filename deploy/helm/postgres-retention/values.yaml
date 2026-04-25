@@ -1,0 +1,63 @@
+# Daily Postgres retention CronJob.
+#
+# Postgres has no native TTL; ClickHouse + Iceberg retention is declared
+# in their respective DDL. This chart fills the gap for flight_telemetry.
+#
+# aircraft_state is intentionally NOT pruned — it's the latest-known-state
+# cache, naturally bounded (~10k rows = one per active icao24 globally).
+# Pruning it would erase live data on aircraft that briefly stop reporting.
+
+# Daily at 03:00 UTC. Quiet for global aviation traffic, off-peak from any
+# OpenSky polling, well clear of Iceberg compaction windows if you add them.
+schedule: "0 3 * * *"
+
+# Forbid: never let two retention runs overlap. If yesterday's job is still
+# running at 03:00 today, today's run is skipped (rare — DELETE on a
+# 7-day window finishes in seconds at our scale).
+concurrencyPolicy: Forbid
+
+# Keep enough history that a stuck retention is visible the next morning,
+# not so much that the cluster gets cluttered with old Job objects.
+successfulJobsHistoryLimit: 3
+failedJobsHistoryLimit: 3
+
+# 5-minute grace if the controller couldn't schedule on time (host restart,
+# control-plane hiccup). Skip the run rather than fire it hours late.
+startingDeadlineSeconds: 300
+
+# 10-minute hard cap. A DELETE on an indexed range over 7 days of data is
+# ~seconds; if it ever takes longer, something is wrong (lock contention,
+# vacuum stuck) and we want the Job to fail loudly, not stall.
+activeDeadlineSeconds: 600
+
+image:
+  # postgres:16-alpine is already pulled by the compose stack; reusing it
+  # avoids dragging another base image just for psql.
+  repository: postgres
+  tag: "16-alpine"
+  pullPolicy: IfNotPresent
+
+env:
+  # 7 days = enough for /aircraft/{icao24}/track to return a meaningful
+  # week-long trajectory; longer horizons live in ClickHouse + Iceberg.
+  RETENTION_DAYS: "7"
+  # DEV-ONLY DSN. For non-local deployments set postgresSecret below and
+  # leave POSTGRES_DSN unset so the chart sources from the Secret.
+  POSTGRES_DSN: "postgres://postgres:postgres@postgres:5432/flight?sslmode=disable"
+
+# Uncomment to source the DSN from a Secret instead of inline env. When set,
+# the template binds POSTGRES_DSN via valueFrom.secretKeyRef and the inline
+# value above is ignored.
+# postgresSecret:
+#   name: df-postgres-dsn
+#   key: dsn
+
+resources:
+  requests:
+    memory: "32Mi"
+    cpu: "10m"
+  limits:
+    # psql + a single DELETE statement: tiny memory footprint. Cap so a
+    # runaway query doesn't starve the node.
+    memory: "128Mi"
+    cpu: "100m"
