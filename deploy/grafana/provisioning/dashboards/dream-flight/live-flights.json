@@ -92,15 +92,14 @@
       "gridPos": { "x": 0, "y": 5, "w": 12, "h": 9 },
       "options": {
         "orientation": "horizontal",
-        "xField": "aircraft",
         "showValue": "always"
       },
-      "fieldConfig": { "defaults": { "custom": {} }, "overrides": [] },
+      "fieldConfig": { "defaults": { "custom": { "axisLabel": "aircraft" } }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
           "format": "table",
-          "rawSql": "SELECT origin_country, count(*) AS aircraft FROM aircraft_state WHERE observed_at >= now() - interval '5 minutes' GROUP BY origin_country ORDER BY aircraft DESC LIMIT 10"
+          "rawSql": "SELECT origin_country, count(*)::int AS aircraft FROM aircraft_state WHERE observed_at >= now() - interval '5 minutes' GROUP BY origin_country ORDER BY aircraft DESC LIMIT 10"
         }
       ]
     },
