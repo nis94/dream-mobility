@@ -94,18 +94,18 @@ func (s *Store) Close() {
 // AircraftState is the last-known state for a single aircraft (one row of
 // aircraft_state). Embedded in the aviation query endpoints.
 type AircraftState struct {
-	Icao24         string    `json:"icao24"`
-	LastCallsign   *string   `json:"last_callsign,omitempty"`
-	OriginCountry  string    `json:"origin_country"`
-	ObservedAt     time.Time `json:"observed_at"`
-	Lat            float64   `json:"lat"`
-	Lon            float64   `json:"lon"`
-	BaroAltitudeM  *float64  `json:"baro_altitude_m,omitempty"`
-	VelocityMs     *float64  `json:"velocity_ms,omitempty"`
-	OnGround       bool      `json:"on_ground"`
-	LastSquawk     *string   `json:"last_squawk,omitempty"`
-	LastEventID    string    `json:"last_event_id"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	Icao24        string    `json:"icao24"`
+	LastCallsign  *string   `json:"last_callsign,omitempty"`
+	OriginCountry string    `json:"origin_country"`
+	ObservedAt    time.Time `json:"observed_at"`
+	Lat           float64   `json:"lat"`
+	Lon           float64   `json:"lon"`
+	BaroAltitudeM *float64  `json:"baro_altitude_m,omitempty"`
+	VelocityMs    *float64  `json:"velocity_ms,omitempty"`
+	OnGround      bool      `json:"on_ground"`
+	LastSquawk    *string   `json:"last_squawk,omitempty"`
+	LastEventID   string    `json:"last_event_id"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // GetAircraft returns the last-known state for the given icao24.
@@ -242,24 +242,24 @@ func (s *Store) ListActive(ctx context.Context, originCountry string, cursor Cur
 // Telemetry is a single observation row from flight_telemetry — the full
 // per-emission state vector. Used by the per-aircraft trajectory endpoint.
 type Telemetry struct {
-	EventID         string    `json:"event_id"`
-	Icao24          string    `json:"icao24"`
-	Callsign        *string   `json:"callsign,omitempty"`
-	OriginCountry   string    `json:"origin_country"`
-	ObservedAt      time.Time `json:"observed_at"`
-	PositionSource  string    `json:"position_source"`
-	Lat             float64   `json:"lat"`
-	Lon             float64   `json:"lon"`
-	BaroAltitudeM   *float64  `json:"baro_altitude_m,omitempty"`
-	GeoAltitudeM    *float64  `json:"geo_altitude_m,omitempty"`
-	VelocityMs      *float64  `json:"velocity_ms,omitempty"`
-	TrueTrackDeg    *float64  `json:"true_track_deg,omitempty"`
-	VerticalRateMs  *float64  `json:"vertical_rate_ms,omitempty"`
-	OnGround        bool      `json:"on_ground"`
-	Squawk          *string   `json:"squawk,omitempty"`
-	Spi             bool      `json:"spi"`
-	Category        *int16    `json:"category,omitempty"`
-	IngestedAt      time.Time `json:"ingested_at"`
+	EventID        string    `json:"event_id"`
+	Icao24         string    `json:"icao24"`
+	Callsign       *string   `json:"callsign,omitempty"`
+	OriginCountry  string    `json:"origin_country"`
+	ObservedAt     time.Time `json:"observed_at"`
+	PositionSource string    `json:"position_source"`
+	Lat            float64   `json:"lat"`
+	Lon            float64   `json:"lon"`
+	BaroAltitudeM  *float64  `json:"baro_altitude_m,omitempty"`
+	GeoAltitudeM   *float64  `json:"geo_altitude_m,omitempty"`
+	VelocityMs     *float64  `json:"velocity_ms,omitempty"`
+	TrueTrackDeg   *float64  `json:"true_track_deg,omitempty"`
+	VerticalRateMs *float64  `json:"vertical_rate_ms,omitempty"`
+	OnGround       bool      `json:"on_ground"`
+	Squawk         *string   `json:"squawk,omitempty"`
+	Spi            bool      `json:"spi"`
+	Category       *int16    `json:"category,omitempty"`
+	IngestedAt     time.Time `json:"ingested_at"`
 }
 
 // TrackPage is a paginated trajectory for a single aircraft.

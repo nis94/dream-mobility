@@ -204,8 +204,10 @@ func NewReader(brokers []string, topic, groupID string, logger *slog.Logger) *ka
 //
 // segmentio/kafka-go's long-poll heartbeat fires on every idle fetch
 // window — a line like:
-//   "no messages received from kafka within the allocated time for
-//    partition X of <topic> at offset Y: [7] Request Timed Out: ..."
+//
+//	"no messages received from kafka within the allocated time for
+//	 partition X of <topic> at offset Y: [7] Request Timed Out: ..."
+//
 // is benign and spams every few seconds per partition. Filter it here
 // so DEBUG-level logs stay useful (event processed, offset commits,
 // batch flushes) without the idle noise.

@@ -5,23 +5,23 @@ package api
 // flat — there's no per-field nesting like the old entity:/position: wrappers,
 // because every field belongs to a single observation about one aircraft.
 type EventRequest struct {
-	EventID         string   `json:"event_id"`
-	Icao24          string   `json:"icao24"`
-	Callsign        *string  `json:"callsign,omitempty"`
-	OriginCountry   string   `json:"origin_country"`
-	ObservedAt      string   `json:"observed_at"`
-	PositionSource  string   `json:"position_source"`
-	Lat             float64  `json:"lat"`
-	Lon             float64  `json:"lon"`
-	BaroAltitudeM   *float64 `json:"baro_altitude_m,omitempty"`
-	GeoAltitudeM    *float64 `json:"geo_altitude_m,omitempty"`
-	VelocityMs      *float64 `json:"velocity_ms,omitempty"`
-	TrueTrackDeg    *float64 `json:"true_track_deg,omitempty"`
-	VerticalRateMs  *float64 `json:"vertical_rate_ms,omitempty"`
-	OnGround        bool     `json:"on_ground"`
-	Squawk          *string  `json:"squawk,omitempty"`
-	Spi             bool     `json:"spi,omitempty"`
-	Category        *int     `json:"category,omitempty"`
+	EventID        string   `json:"event_id"`
+	Icao24         string   `json:"icao24"`
+	Callsign       *string  `json:"callsign,omitempty"`
+	OriginCountry  string   `json:"origin_country"`
+	ObservedAt     string   `json:"observed_at"`
+	PositionSource string   `json:"position_source"`
+	Lat            float64  `json:"lat"`
+	Lon            float64  `json:"lon"`
+	BaroAltitudeM  *float64 `json:"baro_altitude_m,omitempty"`
+	GeoAltitudeM   *float64 `json:"geo_altitude_m,omitempty"`
+	VelocityMs     *float64 `json:"velocity_ms,omitempty"`
+	TrueTrackDeg   *float64 `json:"true_track_deg,omitempty"`
+	VerticalRateMs *float64 `json:"vertical_rate_ms,omitempty"`
+	OnGround       bool     `json:"on_ground"`
+	Squawk         *string  `json:"squawk,omitempty"`
+	Spi            bool     `json:"spi,omitempty"`
+	Category       *int     `json:"category,omitempty"`
 }
 
 // BatchRequest wraps multiple events for the batch ingestion path.
