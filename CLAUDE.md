@@ -39,6 +39,19 @@ loopback interface. To enable anonymous MinIO read on the lake bucket
   invocation reaching a non-local lake with `minioadmin`). For local
   dev: `S3_ACCESS_KEY=minioadmin S3_SECRET_KEY=minioadmin`.
 
+## OpenSky rate limit footgun
+
+- `services/opensky-ingest` polls `https://opensky-network.org/api/states/all`
+  on `POLL_INTERVAL_SECONDS` (default 300s). **Anonymous = 400 credits/day,
+  1 credit per call.** 300s = 288 polls/day, comfortably under the cap.
+  **Do NOT drop below ~215s** without OAuth2 client credentials
+  (4000 credits/day). The fetcher backs off exponentially on HTTP 429,
+  so a misconfigured deployment won't hammer OpenSky, but it WILL stop
+  ingesting until the 24h credit window resets.
+- `replicaCount` is hardcoded to 1 in `deploy/helm/opensky-ingest/templates/deployment.yaml`.
+  Multiple replicas would each independently poll and produce duplicates of
+  every observation; HA would need leader election (out of scope today).
+
 ## Kafka partitioning dictates scale-out
 
 - Topic `flight.telemetry` has **3 partitions**. Per consumer group, at
@@ -54,8 +67,9 @@ loopback interface. To enable anonymous MinIO read on the lake bucket
 
 ## Kubernetes / GitOps layout
 
-- The **compose stack owns infra**; the **kind cluster owns the four Go
-  services** (ingest-api, stream-processor, query-api, clickhouse-sink).
+- The **compose stack owns infra**; the **kind cluster owns the six
+  services** (4 Go: ingest-api, stream-processor, query-api,
+  clickhouse-sink; 2 Python: archiver, opensky-ingest).
   Kind pods reach compose infra via `host.docker.internal`. See
   `deploy/kind/kind-cluster.yaml` for node port mappings
   (30080→host:8080, 30443→host:8443).

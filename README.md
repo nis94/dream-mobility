@@ -1,26 +1,33 @@
-# Dream Flight — Real-Time Movement Intelligence
+# Dream Flight — Real-Time Aircraft Telemetry
 
-A backend pipeline that ingests high-volume GPS-like movement events, validates
-and normalizes them, and stores both raw and derived representations so that
-downstream applications can query last-known position, time-series scans, and
-long-term analytics.
+A backend pipeline that ingests live aircraft state vectors from
+[OpenSky Network](https://openskynetwork.github.io/opensky-api/), validates
+and normalizes them into a typed `FlightTelemetry` schema, and fans them out
+to three sink stores so downstream applications can answer different
+questions: latest known state per aircraft, country/airline analytics, and
+long-term lake replay.
 
-Built as a personal learning project around the Dream Security Detection-group
-take-home assignment. The same task is the vehicle for exercising the full
-production stack: Go, Python, Kafka, Confluent Schema Registry + Avro, Postgres,
-ClickHouse, S3 (MinIO), Apache Iceberg + Parquet, Kubernetes + Helm,
+Built as a personal learning project. The same data goes to three places
+because each excels at a different query shape — point lookups for hot
+state, columnar aggregations for dashboards, schema-evolved Parquet for
+the lake.
+
+Stack: Go, Python, Kafka + Confluent Schema Registry + Avro, Postgres,
+ClickHouse, MinIO + Apache Iceberg, Kubernetes + Helm + ArgoCD,
 OpenTelemetry.
 
 ## Capabilities
 
 | Capability | Path | Latency target |
 |---|---|---|
-| Accept a movement event | HTTP `POST /events` on ingest-api | <50 ms p99 |
-| Deliver to every downstream store | Kafka → independent consumer groups | seconds |
-| Last-known position for an entity | HTTP `GET /entities/{type}/{id}/position` | <20 ms p99 (point read) |
-| Reverse-chronological event history | HTTP `GET /entities/{type}/{id}/events?limit=&cursor=` | <50 ms p99 |
-| Dashboard-grade hourly rollups | ClickHouse `events_hourly_final` view | sub-second scans |
-| Long-term analytical replay | Iceberg + DuckDB / Trino / Spark | minutes |
+| Real-time ingest from OpenSky | `opensky-ingest` polls `/states/all` every 300s | sub-second per poll |
+| Push-side ingest (smoke / chaos / external apps) | HTTP `POST /events` on ingest-api | <50 ms p99 |
+| Deliver to every downstream store | Kafka `flight.telemetry` → independent consumer groups | seconds |
+| Last-known state for an aircraft | HTTP `GET /aircraft/{icao24}` | <20 ms p99 (point read) |
+| Currently active aircraft (last 5 min, optional country filter) | HTTP `GET /flights/active?origin_country=GB` | <50 ms p99 |
+| Per-aircraft trajectory | HTTP `GET /aircraft/{icao24}/track?limit=&cursor=` | <100 ms p99 |
+| Country / airline / airspace-grid analytics | ClickHouse `*_final` rollup views | sub-second scans |
+| Long-term lake replay | Iceberg `flight.telemetry` + DuckDB / Trino / Spark | minutes |
 
 The pipeline is deliberately **three-store** — Postgres for hot state,
 ClickHouse for dashboards, Iceberg for the lake — because each answers a
@@ -101,12 +108,12 @@ sequenceDiagram
     end
 
     Note over C,Q: read path
-    C->>Q: GET /entities/vehicle/v7/position
+    C->>Q: GET /aircraft/abc123
     Q->>PG: point read aircraft_state
-    Q-->>C: 200 {lat, lon, observed_at, last_event_id}
-    C->>Q: GET /entities/vehicle/v7/events?limit=50
+    Q-->>C: 200 {icao24, last_callsign, lat, lon, observed_at, last_event_id}
+    C->>Q: GET /aircraft/abc123/track?limit=50
     Q->>PG: row-wise keyset before cursor (observed_at, event_id)
-    Q-->>C: 200 {events[], next_cursor}
+    Q-->>C: 200 {telemetry[], next_cursor}
 ```
 
 The key invariant running through every arrow: **the Kafka offset advances
@@ -119,12 +126,12 @@ GROUP BY in Iceberg) make that replay a no-op.
 
 | # | Invariant | Enforced by |
 |---|---|---|
-| I1 | Every event has a unique `event_id` post-dedupe in Postgres | `flight_telemetry.event_id PRIMARY KEY` + `ON CONFLICT DO NOTHING` |
-| I2 | `aircraft_state.observed_at` equals `MAX(flight_telemetry.observed_at)` per entity | `WHERE EXCLUDED.observed_at > aircraft_state.observed_at` in the upsert |
+| I1 | Every observation has a unique `event_id` post-dedupe in Postgres | `flight_telemetry.event_id PRIMARY KEY` + `ON CONFLICT DO NOTHING` |
+| I2 | `aircraft_state.observed_at` equals `MAX(flight_telemetry.observed_at)` per `icao24` | `WHERE EXCLUDED.observed_at > aircraft_state.observed_at` in the upsert |
 | I3 | Kafka offset for a message advances only after its downstream write commits | `FetchMessage` → write → `CommitMessages`, with detached context for the commit so SIGTERM doesn't leave the last offset behind |
-| I4 | ClickHouse `event_count` per entity/hour (from `events_hourly_final`) equals distinct `event_id` count in the matching raw time range | `AggregatingMergeTree` with `uniqExactState(event_id)` + read-side `uniqExactMerge` |
-| I5 | Paginated events: every `event_id` is served at most once across pages, including events sharing the same microsecond | Composite `(observed_at, event_id)` cursor + row-wise `< (ts, id)` SQL + `ORDER BY observed_at DESC, event_id DESC` |
-| I6 | Per-entity ordering is preserved into each sink | Producer Murmur2 key = `icao24` → same partition → single consumer owns the partition → sequential reads |
+| I4 | ClickHouse `active_aircraft` (from `*_hourly_*_final` rollups) equals distinct `icao24` count in the matching raw time range | `AggregatingMergeTree` with `uniqExactState(icao24)` + read-side `uniqExactMerge` |
+| I5 | Paginated track: every `event_id` for a given `icao24` is served at most once, including observations sharing the same microsecond | Composite `(observed_at, event_id)` cursor + row-wise `< (ts, id)` SQL + `ORDER BY observed_at DESC, event_id DESC` |
+| I6 | Per-aircraft ordering is preserved into each sink | Producer Murmur2 key = `icao24` → same partition → single consumer owns the partition → sequential reads |
 
 Integration tests (`internal/processor/store_test.go`, build tag
 `integration`) verify I1/I2 against a `testcontainers-go` Postgres. Unit
@@ -135,81 +142,108 @@ smoke below verifies all six together on a live stack.
 
 ### Avro wire contract (Kafka + Schema Registry)
 
-`internal/avro/movement_event.avsc`
+`internal/avro/flight_telemetry.avsc` — 17 fields, every one typed (no
+attributes grab-bag). Maps directly to OpenSky's `/states/all` row shape so
+the producer is a thin adapter.
 
 ```text
 record FlightTelemetry {
-    event_id:    string  (logicalType=uuid),       // dedupe key across every sink
-    entity_type: string,
-    entity_id:   string,
-    timestamp:   long    (logicalType=timestamp-micros),
-    lat, lon:    double,
-    speed_kmh, heading_deg, accuracy_m: [null, double],
-    source:      [null, string],
-    attributes:  [null, string]                    // opaque JSON
+    event_id:         string  (logicalType=uuid)        // UUIDv4 per emission; dedupe key
+    icao24:           string                             // 6-char lowercase hex; partition key
+    callsign:         [null, string]                    // BAW123 / ferry / null
+    origin_country:   string                             // operator country (Iceberg partition)
+    observed_at:      long    (logicalType=timestamp-micros)
+    position_source:  enum {ADSB, ASTERIX, MLAT, FLARM, UNKNOWN}
+    lat, lon:         double
+    baro_altitude_m:  [null, double]                    // both altimeters kept — they disagree
+    geo_altitude_m:   [null, double]
+    velocity_ms:      [null, double]                    // ground speed; native OpenSky unit
+    true_track_deg:   [null, double]                    // 0..359, 0=N
+    vertical_rate_ms: [null, double]                    // climb (+) / descent (-)
+    on_ground:        boolean
+    squawk:           [null, string]                    // 4-octal-digit transponder
+    spi:              boolean                            // special-purpose indicator
+    category:         [null, int]                       // OpenSky aircraft category 0..20
 }
 ```
 
-Wire format on the topic: `0x00` magic + big-endian uint32 schema ID + Avro
-binary payload.
+Topic: `flight.telemetry` (3 partitions, `key=icao24`). Wire format:
+`0x00` magic + big-endian uint32 schema ID + Avro binary payload.
 
 ### Postgres — hot state (`internal/processor/schema.sql`)
 
 ```sql
 flight_telemetry (
-    event_id    UUID PRIMARY KEY,
-    entity_type TEXT, entity_id TEXT,
-    observed_at    TIMESTAMPTZ,
-    lat, lon, speed_kmh, heading_deg, accuracy_m, source, attributes, ingested_at,
+    event_id        UUID PRIMARY KEY,
+    icao24, callsign, origin_country, position_source,
+    observed_at     TIMESTAMPTZ,
+    lat, lon, baro_altitude_m, geo_altitude_m,
+    velocity_ms, true_track_deg, vertical_rate_ms,
+    on_ground, squawk, spi, category, ingested_at,
     CHECK (lat BETWEEN -90 AND 90), CHECK (lon BETWEEN -180 AND 180)
 );
-INDEX idx_flight_telemetry_entity_ts (entity_type, entity_id, observed_at DESC);
+INDEX (icao24, observed_at DESC);
+INDEX (origin_country, observed_at DESC);   -- powers /flights/active?origin_country=
 
 aircraft_state (
-    PRIMARY KEY (entity_type, entity_id),
-    observed_at, lat, lon, last_event_id, updated_at
+    icao24 PRIMARY KEY,
+    last_callsign, origin_country, observed_at,
+    lat, lon, baro_altitude_m, velocity_ms, on_ground,
+    last_squawk, last_event_id, updated_at
 );
 -- Upsert: WHERE EXCLUDED.observed_at > aircraft_state.observed_at  (strict >)
 ```
 
-Strict `>` on the position upsert discards stale events; `READ COMMITTED` +
-the `WHERE` guard are sufficient under a single consumer.
+Strict `>` on the state upsert discards stale observations; `READ COMMITTED`
++ the `WHERE` guard are sufficient under a single consumer.
 
 ### ClickHouse — analytics (`internal/chsink/schema.sql`)
 
+Three rollups feed off the raw table via materialized views, each answering
+a different operational question.
+
 ```sql
-flight_telemetry ReplacingMergeTree(observed_at)
-    ORDER BY (entity_type, entity_id, observed_at, event_id)
-    PARTITION BY toYYYYMM(observed_at);
+flight.telemetry ReplacingMergeTree(observed_at)
+    ORDER BY (icao24, observed_at, event_id)
+    PARTITION BY toYYYYMM(observed_at)
+    TTL toDateTime(observed_at) + INTERVAL 180 DAY;
 
-events_hourly AggregatingMergeTree
-    ORDER BY (entity_type, entity_id, hour)
-    TTL hour + INTERVAL 90 DAY DELETE;
+-- Rollup 1: country-level operations
+flight.telemetry_hourly_by_country AggregatingMergeTree
+    ORDER BY (origin_country, hour)
+    columns: uniq_aircraft, sum/count_velocity, sum/count_baro_alt,
+             climbing_count, descending_count, cruising_count,
+             on_ground_count, emergency_squawks_count
 
-events_hourly_mv → events_hourly AS SELECT
-    entity_type, entity_id, toStartOfHour(observed_at) AS hour,
-    uniqExactState(event_id)  AS uniq_events,
-    sumIf(speed_kmh, IS NOT NULL) AS sum_speed,
-    countIf(speed_kmh IS NOT NULL) AS speed_count
-FROM flight_telemetry GROUP BY entity_type, entity_id, hour;
+-- Rollup 2: airline-level tempo (callsign first 3 chars = ICAO airline code)
+flight.telemetry_hourly_by_airline AggregatingMergeTree
+    ORDER BY (callsign_prefix, hour)
+    columns: uniq_aircraft, uniq_callsigns, sum/count_velocity,
+             climbing/descending/cruising/on_ground counts
 
--- Canonical read views (hide FINAL / argMax / uniqExactMerge from callers)
-flight_telemetry_final    = SELECT * FROM flight_telemetry FINAL
-events_hourly_final = uniqExactMerge + sum_speed/speed_count
+-- Rollup 3: 0.25° airspace-density grid in 5-minute buckets (airborne only)
+flight.airspace_grid_5min AggregatingMergeTree
+    ORDER BY (bucket_5min, lat_cell, lon_cell)
+    columns: uniq_aircraft
+
+-- Each gets a *_final view that uniqExactMerge / sums for read-time scalars
+flight.telemetry_final, *_hourly_by_country_final, *_hourly_by_airline_final, *_grid_5min_final
 ```
 
-`uniqExactState` instead of `count()` is load-bearing: at-least-once
+`uniqExactState(icao24)` instead of `count()` is load-bearing: at-least-once
 redelivery writes duplicate rows, and a `SummingMergeTree` MV would
-double-count per INSERT block. `uniqExact*` collapses by `event_id` at
-query time so counts match Postgres.
+double-count per INSERT block. `uniqExact*` collapses at query time so
+active-aircraft counts match Postgres.
 
 ### Iceberg — long-term lake (`services/archiver/archiver.py`)
 
-- Table: `mobility.flight_telemetry`, 12 columns, explicit IDs 1–12 for schema
-  evolution.
-- Partition spec: `days(observed_at)` (hidden) + `identity(entity_type)`.
-- At-least-once, dedup-at-read-time by `event_id` (Iceberg has no native
-  uniqueness).
+- Table: `flight.telemetry`, 18 columns, explicit field IDs 1–18 for schema evolution.
+- Partition spec: `days(observed_at)` (hidden) + `identity(origin_country)`.
+  "All UK flights last week" prunes ~95% of files.
+- Sort order within partition: `observed_at ASC` for tight Parquet row-group
+  min/max pruning under out-of-order ingest.
+- At-least-once, with in-batch dedup by `event_id` at flush; cross-batch
+  dedup is read-time (`SELECT DISTINCT ON (event_id)` or equivalent).
 - Storage: `s3://lake/` on MinIO; Iceberg REST catalog is the metadata
   authority.
 
@@ -230,7 +264,13 @@ go run ./cmd/stream-processor &
 go run ./cmd/query-api        &
 go run ./cmd/clickhouse-sink  &
 
-# 4. Emit synthetic events (with duplicate + out-of-order injection for dedupe testing)
+# 4a. Pull live data from OpenSky (the primary path)
+cd services/opensky-ingest && uv sync
+KAFKA_BROKERS=localhost:29092 \
+SCHEMA_REGISTRY_URL=http://localhost:8081 \
+uv run python opensky_ingest.py    # polls every 300s; ctrl-c to stop
+
+# 4b. Or generate synthetic chaos data (dupes + out-of-order — only deterministic way to test those)
 make generator-install
 cd tools/generator && uv run python gen.py \
   --rate 50 --duration 10 --entities 5 \
@@ -238,8 +278,9 @@ cd tools/generator && uv run python gen.py \
   --target http://localhost:8080/events:batch
 
 # 5. Query the hot-state store
-curl -s http://localhost:8090/entities/vehicle/vehicle-0/position | jq
-curl -s 'http://localhost:8090/entities/vehicle/vehicle-0/events?limit=5' | jq
+curl -s http://localhost:8090/aircraft/abc123 | jq
+curl -s 'http://localhost:8090/flights/active?origin_country=United%20Kingdom' | jq
+curl -s 'http://localhost:8090/aircraft/abc123/track?limit=10' | jq
 
 # 6. When you're done
 make down       # keep volumes
@@ -250,40 +291,42 @@ make down-v     # wipe volumes (destructive)
 
 ## End-to-end verification
 
-After running the generator burst above, the six invariants should all hold:
+After ingesting some data (live from OpenSky, or a generator burst), the
+six invariants should all hold:
 
 ```sql
 -- I1: Postgres dedupe
-SELECT COUNT(*) AS total, COUNT(DISTINCT event_id) AS distinct FROM flight_telemetry;
+SELECT count(*) AS total, count(DISTINCT event_id) AS distinct FROM flight_telemetry;
 
--- I2: out-of-order gate — every entity's position matches the max raw observed_at
-SELECT r.entity_type, r.entity_id,
-       MAX(r.observed_at) AS max_raw, p.observed_at AS pos,
-       (MAX(r.observed_at) = p.observed_at) AS ok
-FROM flight_telemetry r JOIN aircraft_state p USING (entity_type, entity_id)
-GROUP BY r.entity_type, r.entity_id, p.observed_at;
+-- I2: out-of-order gate — every aircraft's state matches its MAX raw observed_at
+SELECT r.icao24,
+       MAX(r.observed_at) AS max_raw, s.observed_at AS state,
+       (MAX(r.observed_at) = s.observed_at) AS ok
+FROM flight_telemetry r JOIN aircraft_state s USING (icao24)
+GROUP BY r.icao24, s.observed_at;
 
--- I4: ClickHouse distinct count parity with Postgres
-SELECT count(), uniqExact(event_id) FROM mobility.flight_telemetry_final;
-SELECT entity_type, entity_id, hour, event_count, avg_speed_kmh
-FROM mobility.events_hourly_final ORDER BY entity_type, entity_id, hour;
+-- I4: ClickHouse distinct-count parity with Postgres
+SELECT count(), uniqExact(event_id) FROM flight.telemetry_final;
+SELECT origin_country, hour, active_aircraft, avg_velocity_ms
+FROM flight.telemetry_hourly_by_country_final
+ORDER BY hour DESC, active_aircraft DESC LIMIT 10;
 ```
 
-Expected after a 10-second burst with `--duplicates 0.2 --out-of-order 0.15`
-(310 emitted, 62 dup, 33 OOO): Postgres + ClickHouse each hold 248 distinct
-events; hourly rollup sums to 248; no entity has a position older than its
-max raw event.
+Expected after a 5-minute OpenSky poll: ~5,000-10,000 distinct `icao24` rows
+in `aircraft_state`, the same row count in `flight.telemetry` ± broker-retry
+duplicates (the `_final` view collapses them). `_hourly_by_country` shows
+the leaderboard of operator countries — typically US, UK, Germany on top.
 
 ## Service endpoints (local)
 
 | Service | Endpoint | Notes |
 |---------|----------|-------|
 | ingest-api | <http://localhost:8080> | `POST /events`, `GET /health` |
-| query-api | <http://localhost:8090> | `GET /entities/{type}/{id}/position` and `/events` |
+| query-api | <http://localhost:8090> | `GET /aircraft/{icao24}`, `/aircraft/{icao24}/track`, `/flights/active` |
 | Kafka broker (host) | `localhost:29092` | `PLAINTEXT_HOST` listener for `kcat`/CLI |
-| Schema Registry | <http://localhost:8081> | Confluent CP |
+| Schema Registry | <http://localhost:8081> | Confluent CP — subject `flight.telemetry-value` |
 | Kafka UI | <http://localhost:8088> | Provectus |
-| Postgres | `postgres://postgres:postgres@localhost:5432/mobility` | |
+| Postgres | `postgres://postgres:postgres@localhost:5432/flight` | |
 | ClickHouse HTTP | <http://localhost:8123> | default user, no password |
 | ClickHouse native | `tcp://localhost:9000` | |
 | MinIO API | <http://localhost:9100> | `minioadmin` / `minioadmin` |
@@ -313,10 +356,11 @@ All services read env vars via `internal/config`.
 | `PROM_PORT` | all Go services | `9464`/`9465`/`9466`/`9467` | Prometheus `/metrics` port (per service) |
 | `KAFKA_BROKERS` | all | `localhost:29092` | Comma-separated bootstrap list |
 | `KAFKA_TOPIC` | all | `flight.telemetry` | Source topic |
-| `KAFKA_GROUP_ID` | stream-processor / clickhouse-sink | `flight-postgres` / `flight-clickhouse` | Consumer group |
-| `SCHEMA_REGISTRY_URL` | ingest-api | `http://localhost:8081` | SR endpoint |
-| `POSTGRES_DSN` | stream-processor / query-api | `postgres://postgres:postgres@localhost:5432/mobility?sslmode=disable` | DSN; **logged with password stripped** via `config.RedactDSN` |
-| `CLICKHOUSE_ADDR` / `CLICKHOUSE_DB` | clickhouse-sink | `localhost:9000` / `mobility` | Native protocol |
+| `KAFKA_GROUP_ID` | stream-processor / clickhouse-sink / archiver | `flight-postgres` / `flight-clickhouse` / `flight-iceberg` | Consumer group |
+| `SCHEMA_REGISTRY_URL` | ingest-api / opensky-ingest | `http://localhost:8081` | SR endpoint |
+| `POSTGRES_DSN` | stream-processor / query-api | `postgres://postgres:postgres@localhost:5432/flight?sslmode=disable` | DSN; **logged with password stripped** via `config.RedactDSN` |
+| `CLICKHOUSE_ADDR` / `CLICKHOUSE_DB` | clickhouse-sink | `localhost:9000` / `flight` | Native protocol |
+| `POLL_INTERVAL_SECONDS` | opensky-ingest | `300` | OpenSky polling cadence; anonymous limit 400 credits/day → don't drop below 215s |
 | `CLICKHOUSE_BATCH_SIZE` / `CLICKHOUSE_BATCH_TIMEOUT` / `CLICKHOUSE_BUFFER_MAX` | clickhouse-sink | `5000` / `2s` / `20000` | Batch + backpressure tuning |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | `http://localhost:4318` | OTLP/HTTP receiver |
 | `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `ICEBERG_CATALOG_URI` / `ICEBERG_CATALOG_TOKEN` | archiver / lake-query | (**no default for secrets**) | Iceberg side |
@@ -336,8 +380,9 @@ override-able via `pool_*` DSN params.
 | Hot-state store | Postgres 16 | Atomic dedupe + `observed_at`-gated upsert in one `ON CONFLICT` transaction |
 | Analytical store | ClickHouse | Columnar scans; `ReplacingMergeTree` for dedupe; `AggregatingMergeTree` MV stays correct under redelivery |
 | Lake storage | MinIO + Apache Iceberg + Parquet | Long retention, schema-evolution, DuckDB/Trino-friendly |
-| Python role | Event generator + Iceberg archiver + DuckDB CLI | PyIceberg is more ergonomic than Go for Iceberg writes |
-| Orchestration | docker-compose primary; Helm charts for kind | Fast iteration locally; Helm covers the K8s path |
+| Live data source | `opensky-ingest` (Python) polling OpenSky `/states/all` direct → Kafka | Pull-based source has no reason to round-trip through HTTP; ingest-api stays for push clients |
+| Python role | Live producer + Iceberg archiver + chaos generator + DuckDB CLI | PyIceberg + confluent-kafka-python are more ergonomic for Iceberg + adapter shapes |
+| Orchestration | docker-compose primary; Helm charts + ArgoCD for kind | Fast iteration locally; ArgoCD app-of-apps is the declarative path |
 | Observability | OpenTelemetry → Prometheus + Grafana + Jaeger | One SDK, three signals; end-to-end traces on demand |
 | Containers | distroless + non-root UID 65532 | Smallest attack surface |
 
@@ -411,14 +456,16 @@ Built phase-by-phase. Each phase closed with an
 │   ├── producer/           # Kafka producer with SR wire format
 │   └── query/              # query-api handler, store, cursor
 ├── services/
-│   └── archiver/           # Python Kafka→Iceberg archiver
+│   ├── archiver/           # Python Kafka→Iceberg archiver (group: flight-iceberg)
+│   └── opensky-ingest/     # Python OpenSky→Kafka producer (live data path)
 ├── tools/
-│   ├── generator/          # Python synthetic event generator
-│   └── lake-query/         # Python DuckDB-over-Iceberg CLI
+│   ├── generator/          # Synthetic chaos generator (--duplicates / --out-of-order)
+│   └── lake-query/         # DuckDB-over-Iceberg CLI
 ├── deploy/
-│   ├── docker-compose.yml          # Local infra stack
+│   ├── docker-compose.yml          # Local infra stack (kafka, postgres, ch, minio, iceberg-rest)
 │   ├── observability/              # Opt-in OTel + Prom + Grafana + Jaeger
-│   └── helm/                       # Helm charts (one per Go service)
+│   ├── helm/                       # Helm charts (Go services + 2 Python services)
+│   └── argocd/                     # App-of-apps: 6 ArgoCD Applications
 ├── loadtest/               # k6 scripts + chaos scenarios
 ├── scripts/                # Shell helpers (register-schemas, kind-up, smoke, ...)
 ├── .claude/                # Reviewer agents + /audit slash command
@@ -440,5 +487,5 @@ make sr-state -- --probe-evolution                              # BACKWARD-compa
 
 - **`make up` hangs on a service**: `docker compose -f deploy/docker-compose.yml -p dream-flight logs <service>`. Healthchecks have generous timeouts but a wedged container will block `--wait`.
 - **Port already in use**: most likely Postgres (5432), ClickHouse (9000 native), MinIO (9100), or a Prometheus port (9464–9467) from a stray `go run`. `lsof -ti:<port> | xargs kill` clears it.
-- **ClickHouse sink won't start — "Database mobility does not exist"**: the compose volume is from an older schema. Run `make down-v && make up` to rebuild.
+- **ClickHouse sink won't start — "Database flight does not exist"**: the compose volume is from an older schema. Run `make down-v && make up` to rebuild.
 - **Wipe everything and start fresh**: `make down-v && make up`.

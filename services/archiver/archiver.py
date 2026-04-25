@@ -429,8 +429,8 @@ def run(args: argparse.Namespace) -> None:
                 event = decode_avro_event(msg.value())
                 if event is not None:
                     span.set_attribute("event.id", event["event_id"])
-                    span.set_attribute("entity.type", event["entity_type"])
-                    span.set_attribute("entity.id", event["entity_id"])
+                    span.set_attribute("aircraft.icao24", event["icao24"])
+                    span.set_attribute("aircraft.origin_country", event["origin_country"])
                     # add() returns True when it triggered a size-based flush.
                     flushed = archiver.add(event)
                     if not flushed and archiver.should_flush():

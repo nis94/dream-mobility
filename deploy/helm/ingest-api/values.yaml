@@ -18,7 +18,7 @@ env:
   HTTP_PORT: "8080"
   PROM_PORT: "9464"
   KAFKA_BROKERS: "kafka:9092"
-  KAFKA_TOPIC: "movement.events"
+  KAFKA_TOPIC: "flight.telemetry"
   SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
   # INFO is the production default. Override to DEBUG in values-kind.yaml

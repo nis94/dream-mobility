@@ -209,8 +209,8 @@ Why Postgres and not, say, Redis or Cassandra?
 - **Familiar**. Every backend engineer speaks Postgres. It is the
   least-surprising choice.
 - **Indexing for our access patterns is trivial**. The hot read is
-  a keyset pagination on `(entity_type, entity_id, observed_at DESC,
-  event_id DESC)` — one composite index, done.
+  a keyset pagination on `(icao24, observed_at DESC, event_id DESC)` —
+  one composite index, done.
 
 What Postgres is bad at, and why we didn't pick it for everything:
 scanning a million rows to compute an hourly aggregate would either
