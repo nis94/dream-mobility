@@ -3,297 +3,224 @@ package query
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"sort"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 )
 
-// fakeStore implements dataStore for handler tests. It mirrors the real
-// store's algorithm faithfully: order events by (event_ts DESC, event_id
-// DESC), filter strictly below the cursor using row-wise compare, fetch
-// limit+1, then slice to limit and encode the cursor from the last row.
+// fakeStore implements dataStore for handler tests. Minimal — exercises only
+// the dispatch + 200/404/400 paths the handler owns. Database-shaped behavior
+// (cursor compare, ordering) is tested in store_test.go via a real Postgres.
 type fakeStore struct {
-	positions map[string]*Position  // key: "type:id"
-	events    map[string][]RawEvent // key: "type:id"; order does not matter
+	state map[string]*AircraftState // key: icao24
+	track map[string][]Telemetry    // key: icao24
+	err   error                     // injected error for failure paths
 }
 
-func (f *fakeStore) GetPosition(_ context.Context, entityType, entityID string) (*Position, error) {
-	p, ok := f.positions[entityType+":"+entityID]
+func (f *fakeStore) GetAircraft(_ context.Context, icao24 string) (*AircraftState, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	a, ok := f.state[icao24]
 	if !ok {
 		return nil, ErrNotFound
 	}
-	return p, nil
+	return a, nil
 }
 
-func (f *fakeStore) ListEvents(_ context.Context, entityType, entityID string, cursor Cursor, limit int) (*EventsPage, error) {
-	switch {
-	case limit <= 0:
+func (f *fakeStore) GetTrack(_ context.Context, icao24 string, _ Cursor, limit int) (*TrackPage, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if limit <= 0 {
 		limit = defaultLimit
-	case limit > maxLimit:
+	}
+	if limit > maxLimit {
 		limit = maxLimit
 	}
-
-	all := append([]RawEvent(nil), f.events[entityType+":"+entityID]...)
-	sort.Slice(all, func(i, j int) bool {
-		if !all[i].EventTS.Equal(all[j].EventTS) {
-			return all[i].EventTS.After(all[j].EventTS)
-		}
-		return all[i].EventID > all[j].EventID
-	})
-
-	fetchLimit := limit + 1
-	filtered := make([]RawEvent, 0, fetchLimit)
-	for _, e := range all {
-		if !cursor.IsZero() {
-			// Row-wise strict-less: keep rows where (e.EventTS, e.EventID)
-			// is strictly less than (cursor.EventTS, cursor.EventID) under
-			// the same DESC ordering.
-			if e.EventTS.After(cursor.EventTS) {
-				continue
-			}
-			if e.EventTS.Equal(cursor.EventTS) && e.EventID >= cursor.EventID {
-				continue
-			}
-		}
-		filtered = append(filtered, e)
-		if len(filtered) == fetchLimit {
-			break
-		}
+	out := f.track[icao24]
+	if len(out) > limit {
+		out = out[:limit]
 	}
-
-	page := &EventsPage{Events: filtered}
-	if len(filtered) > limit {
-		page.Events = filtered[:limit]
-		last := filtered[limit-1]
-		page.NextCursor = Cursor{EventTS: last.EventTS, EventID: last.EventID}.Encode()
-	}
-	return page, nil
+	return &TrackPage{Telemetry: out}, nil
 }
 
-func silentLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+func (f *fakeStore) ListActive(_ context.Context, originCountry string, _ Cursor, _ int) (*ActiveAircraftPage, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make([]AircraftState, 0, len(f.state))
+	for _, a := range f.state {
+		if originCountry != "" && a.OriginCountry != originCountry {
+			continue
+		}
+		out = append(out, *a)
+	}
+	return &ActiveAircraftPage{Aircraft: out}, nil
 }
 
-func newTestRouter(h *Handler) *chi.Mux {
+func newTestHandler(s dataStore) *Handler {
+	return NewHandler(s, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func newRouter(h *Handler) http.Handler {
 	r := chi.NewRouter()
-	r.Route("/entities/{type}/{id}", func(r chi.Router) {
-		r.Get("/position", h.GetPosition)
-		r.Get("/events", h.ListEvents)
+	r.Get("/flights/active", h.ListActive)
+	r.Route("/aircraft/{icao24}", func(r chi.Router) {
+		r.Get("/", h.GetAircraft)
+		r.Get("/track", h.GetTrack)
 	})
 	return r
 }
 
-func TestGetPosition_Found(t *testing.T) {
-	ts := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
-	store := &fakeStore{
-		positions: map[string]*Position{
-			"vehicle:v1": {
-				EntityType: "vehicle", EntityID: "v1",
-				EventTS: ts, Lat: 52.52, Lon: 13.405,
-				LastEventID: "00000000-0000-0000-0000-000000000001",
-				UpdatedAt:   ts,
-			},
-		},
-	}
-	h := NewHandler(store, silentLogger())
-	r := newTestRouter(h)
+func TestGetAircraft_OK(t *testing.T) {
+	s := &fakeStore{state: map[string]*AircraftState{
+		"abc123": {Icao24: "abc123", OriginCountry: "GB", ObservedAt: time.Now(), Lat: 51.5, Lon: -0.1, LastEventID: "ev-1"},
+	}}
+	h := newTestHandler(s)
+	r := newRouter(h)
 
-	req := httptest.NewRequest(http.MethodGet, "/entities/vehicle/v1/position", nil)
+	req := httptest.NewRequest(http.MethodGet, "/aircraft/abc123", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	var pos Position
-	if err := json.Unmarshal(rec.Body.Bytes(), &pos); err != nil {
+	var got AircraftState
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if pos.Lat != 52.52 || pos.Lon != 13.405 {
-		t.Errorf("position = (%f, %f), want (52.52, 13.405)", pos.Lat, pos.Lon)
+	if got.Icao24 != "abc123" {
+		t.Errorf("icao24 = %q", got.Icao24)
 	}
 }
 
-func TestGetPosition_NotFound(t *testing.T) {
-	store := &fakeStore{positions: map[string]*Position{}}
-	h := NewHandler(store, silentLogger())
-	r := newTestRouter(h)
+func TestGetAircraft_NotFound(t *testing.T) {
+	s := &fakeStore{state: map[string]*AircraftState{}}
+	h := newTestHandler(s)
+	r := newRouter(h)
 
-	req := httptest.NewRequest(http.MethodGet, "/entities/vehicle/unknown/position", nil)
+	req := httptest.NewRequest(http.MethodGet, "/aircraft/missing", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want 404", rec.Code)
+		t.Fatalf("status = %d, want 404", rec.Code)
 	}
 }
 
-func TestListEvents_Paginated(t *testing.T) {
-	t1 := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
-	t2 := time.Date(2025, 1, 1, 10, 1, 0, 0, time.UTC)
-	t3 := time.Date(2025, 1, 1, 10, 2, 0, 0, time.UTC)
+func TestGetAircraft_InternalError(t *testing.T) {
+	s := &fakeStore{err: errors.New("pg down")}
+	h := newTestHandler(s)
+	r := newRouter(h)
 
-	store := &fakeStore{
-		events: map[string][]RawEvent{
-			"vehicle:v1": {
-				{EventID: "c", EventTS: t3, EntityType: "vehicle", EntityID: "v1", Lat: 3, Lon: 3},
-				{EventID: "b", EventTS: t2, EntityType: "vehicle", EntityID: "v1", Lat: 2, Lon: 2},
-				{EventID: "a", EventTS: t1, EntityType: "vehicle", EntityID: "v1", Lat: 1, Lon: 1},
-			},
-		},
-	}
-	h := NewHandler(store, silentLogger())
-	r := newTestRouter(h)
-
-	// Page 1: limit=2 → expect [c, b] with a non-empty cursor.
-	req := httptest.NewRequest(http.MethodGet, "/entities/vehicle/v1/events?limit=2", nil)
+	req := httptest.NewRequest(http.MethodGet, "/aircraft/abc123", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
 	}
-	var page EventsPage
+}
+
+func TestListActive_OK(t *testing.T) {
+	s := &fakeStore{state: map[string]*AircraftState{
+		"a": {Icao24: "a", OriginCountry: "GB", ObservedAt: time.Now()},
+		"b": {Icao24: "b", OriginCountry: "DE", ObservedAt: time.Now()},
+	}}
+	h := newTestHandler(s)
+	r := newRouter(h)
+
+	req := httptest.NewRequest(http.MethodGet, "/flights/active", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var page ActiveAircraftPage
 	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
-		t.Fatalf("decode page 1: %v", err)
+		t.Fatalf("decode: %v", err)
 	}
-	if len(page.Events) != 2 || page.Events[0].EventID != "c" || page.Events[1].EventID != "b" {
-		t.Fatalf("page 1 = %+v, want [c, b]", page.Events)
-	}
-	if page.NextCursor == "" {
-		t.Fatal("expected non-empty next_cursor for first page")
-	}
-
-	// Page 2: cursor from page 1 → expect [a], empty cursor.
-	req2 := httptest.NewRequest(http.MethodGet, "/entities/vehicle/v1/events?limit=2&cursor="+page.NextCursor, nil)
-	rec2 := httptest.NewRecorder()
-	r.ServeHTTP(rec2, req2)
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("page 2 status = %d; body = %s", rec2.Code, rec2.Body.String())
-	}
-	var page2 EventsPage
-	if err := json.Unmarshal(rec2.Body.Bytes(), &page2); err != nil {
-		t.Fatalf("decode page 2: %v", err)
-	}
-	if len(page2.Events) != 1 || page2.Events[0].EventID != "a" {
-		t.Errorf("page 2 = %+v, want [a]", page2.Events)
-	}
-	if page2.NextCursor != "" {
-		t.Errorf("expected empty cursor on last page, got %q", page2.NextCursor)
+	if len(page.Aircraft) != 2 {
+		t.Errorf("got %d aircraft, want 2", len(page.Aircraft))
 	}
 }
 
-// TestListEvents_TieBreakAcrossPages is the regression test for the Phase 4
-// audit's Critical finding: two events sharing the same event_ts must not
-// be dropped at a page boundary. With a cursor that carries only (event_ts),
-// the second event at t2 would vanish between pages. With the composite
-// (event_ts, event_id) cursor plus row-wise comparison, both are served.
-func TestListEvents_TieBreakAcrossPages(t *testing.T) {
-	t1 := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
-	t2 := time.Date(2025, 1, 1, 10, 1, 0, 0, time.UTC)
+func TestListActive_FilterByCountry(t *testing.T) {
+	s := &fakeStore{state: map[string]*AircraftState{
+		"a": {Icao24: "a", OriginCountry: "GB", ObservedAt: time.Now()},
+		"b": {Icao24: "b", OriginCountry: "DE", ObservedAt: time.Now()},
+	}}
+	h := newTestHandler(s)
+	r := newRouter(h)
 
-	// Four events for v1: one at t1, three at the same t2.
-	store := &fakeStore{
-		events: map[string][]RawEvent{
-			"vehicle:v1": {
-				{EventID: "z", EventTS: t2, EntityType: "vehicle", EntityID: "v1"},
-				{EventID: "y", EventTS: t2, EntityType: "vehicle", EntityID: "v1"},
-				{EventID: "x", EventTS: t2, EntityType: "vehicle", EntityID: "v1"},
-				{EventID: "a", EventTS: t1, EntityType: "vehicle", EntityID: "v1"},
-			},
-		},
-	}
-	h := NewHandler(store, silentLogger())
-	r := newTestRouter(h)
-
-	seen := map[string]bool{}
-	cursor := ""
-	pages := 0
-	for {
-		path := "/entities/vehicle/v1/events?limit=2"
-		if cursor != "" {
-			path += "&cursor=" + cursor
-		}
-		req := httptest.NewRequest(http.MethodGet, path, nil)
-		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("page %d status = %d; body = %s", pages, rec.Code, rec.Body.String())
-		}
-		var page EventsPage
-		if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
-			t.Fatalf("decode page %d: %v", pages, err)
-		}
-		for _, e := range page.Events {
-			if seen[e.EventID] {
-				t.Fatalf("event %q served twice", e.EventID)
-			}
-			seen[e.EventID] = true
-		}
-		pages++
-		if page.NextCursor == "" {
-			break
-		}
-		cursor = page.NextCursor
-		if pages > 10 {
-			t.Fatal("pagination did not terminate")
-		}
-	}
-
-	for _, id := range []string{"z", "y", "x", "a"} {
-		if !seen[id] {
-			t.Errorf("event %q was skipped across pages", id)
-		}
-	}
-}
-
-func TestListEvents_EmptyResult(t *testing.T) {
-	store := &fakeStore{events: map[string][]RawEvent{}}
-	h := NewHandler(store, silentLogger())
-	r := newTestRouter(h)
-
-	req := httptest.NewRequest(http.MethodGet, "/entities/vehicle/unknown/events", nil)
+	req := httptest.NewRequest(http.MethodGet, "/flights/active?origin_country=GB", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Errorf("status = %d, want 200 (empty list, not 404)", rec.Code)
+	var page ActiveAircraftPage
+	_ = json.Unmarshal(rec.Body.Bytes(), &page)
+	if len(page.Aircraft) != 1 || page.Aircraft[0].OriginCountry != "GB" {
+		t.Errorf("filter failed: got %+v", page.Aircraft)
 	}
 }
 
-func TestListEvents_BadCursor(t *testing.T) {
-	store := &fakeStore{events: map[string][]RawEvent{}}
-	h := NewHandler(store, silentLogger())
-	r := newTestRouter(h)
+func TestGetTrack_BadLimit(t *testing.T) {
+	h := newTestHandler(&fakeStore{})
+	r := newRouter(h)
 
-	req := httptest.NewRequest(http.MethodGet, "/entities/vehicle/v1/events?cursor=not-a-valid-token", nil)
+	req := httptest.NewRequest(http.MethodGet, "/aircraft/abc123/track?limit=9999", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400", rec.Code)
+		t.Fatalf("status = %d, want 400 for over-max limit", rec.Code)
 	}
 }
 
-func TestListEvents_BadLimit(t *testing.T) {
-	store := &fakeStore{events: map[string][]RawEvent{}}
-	h := NewHandler(store, silentLogger())
-	r := newTestRouter(h)
+func TestGetTrack_BadCursor(t *testing.T) {
+	h := newTestHandler(&fakeStore{})
+	r := newRouter(h)
 
-	cases := []string{"abc", "0", "-5", "5000"}
-	for _, v := range cases {
-		t.Run(v, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/entities/vehicle/v1/events?limit="+v, nil)
-			rec := httptest.NewRecorder()
-			r.ServeHTTP(rec, req)
-			if rec.Code != http.StatusBadRequest {
-				t.Errorf("limit=%s → status %d, want 400; body = %s", v, rec.Code, rec.Body.String())
-			}
-		})
+	req := httptest.NewRequest(http.MethodGet, "/aircraft/abc123/track?cursor=not-a-valid-cursor", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for bad cursor", rec.Code)
+	}
+}
+
+func TestGetTrack_OK(t *testing.T) {
+	s := &fakeStore{track: map[string][]Telemetry{
+		"abc123": {
+			{EventID: "1", Icao24: "abc123", OriginCountry: "GB", ObservedAt: time.Now()},
+			{EventID: "2", Icao24: "abc123", OriginCountry: "GB", ObservedAt: time.Now().Add(-1 * time.Minute)},
+		},
+	}}
+	h := newTestHandler(s)
+	r := newRouter(h)
+
+	req := httptest.NewRequest(http.MethodGet, "/aircraft/abc123/track", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var page TrackPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(page.Telemetry) != 2 {
+		t.Errorf("got %d telemetry rows, want 2", len(page.Telemetry))
 	}
 }

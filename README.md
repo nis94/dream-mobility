@@ -1,4 +1,4 @@
-# Dream Mobility — Real-Time Movement Intelligence
+# Dream Flight — Real-Time Movement Intelligence
 
 A backend pipeline that ingests high-volume GPS-like movement events, validates
 and normalizes them, and stores both raw and derived representations so that
@@ -32,14 +32,14 @@ different question better than the other two. Kafka is the fan-out point.
 flowchart LR
     EXT[External Clients] -->|HTTP POST /events| API[ingest-api<br/>Go + chi]
     GEN[Python Synthetic<br/>Generator] -->|HTTP| API
-    API -->|Avro + SR wire format| KAFKA[(Kafka topic<br/>movement.events<br/>key = entity_type:entity_id)]
+    API -->|Avro + SR wire format| KAFKA[(Kafka topic<br/>flight.telemetry<br/>key = icao24)]
     SR[(Schema Registry)] -.->|schema id cache| API
 
-    KAFKA --> PROC[stream-processor<br/>group: mobility-postgres]
-    KAFKA --> CHSINK[clickhouse-sink<br/>group: mobility-clickhouse<br/>batched, per-batch commit]
-    KAFKA --> ARCH[archiver<br/>group: mobility-iceberg<br/>PyIceberg]
+    KAFKA --> PROC[stream-processor<br/>group: flight-postgres]
+    KAFKA --> CHSINK[clickhouse-sink<br/>group: flight-clickhouse<br/>batched, per-batch commit]
+    KAFKA --> ARCH[archiver<br/>group: flight-iceberg<br/>PyIceberg]
 
-    PROC -->|ON CONFLICT + tx| PG[(Postgres<br/>raw_events +<br/>entity_positions)]
+    PROC -->|ON CONFLICT + tx| PG[(Postgres<br/>flight_telemetry +<br/>aircraft_state)]
     CHSINK -->|batched INSERT| CH[(ClickHouse<br/>ReplacingMergeTree +<br/>AggregatingMergeTree MV)]
     ARCH -->|Parquet| MINIO[(MinIO / S3)]
     ARCH -.->|metadata| ICAT[Iceberg REST Catalog]
@@ -66,7 +66,7 @@ sequenceDiagram
     autonumber
     participant C as Client
     participant A as ingest-api
-    participant K as Kafka<br/>movement.events
+    participant K as Kafka<br/>flight.telemetry
     participant P as stream-processor
     participant H as clickhouse-sink
     participant I as archiver
@@ -78,23 +78,23 @@ sequenceDiagram
     C->>A: POST /events {batch or single JSON}
     A->>A: validate → map to flat Avro record
     A->>A: Marshal + prepend SR wire format<br/>(0x00 + schema id + Avro binary)
-    A->>K: WriteMessages key=entity_type:entity_id (Murmur2)
+    A->>K: WriteMessages key=icao24 (Murmur2)
     A-->>C: 202 {accepted, rejected, errors[]}
 
     par independent consumer groups
-        K->>P: FetchMessage(mobility-postgres)
+        K->>P: FetchMessage(flight-postgres)
         P->>P: decode SR wire format
-        P->>PG: BEGIN; INSERT raw_events ON CONFLICT; UPSERT entity_positions (timestamp-gated)
+        P->>PG: BEGIN; INSERT flight_telemetry ON CONFLICT; UPSERT aircraft_state (timestamp-gated)
         PG-->>P: committed
         P->>K: CommitMessages (detached 5s ctx)
     and
-        K->>H: FetchMessage(mobility-clickhouse)
+        K->>H: FetchMessage(flight-clickhouse)
         H->>H: buffer up to batch_size or batch_timeout
         H->>CH: prepareBatch / Append / Send
         CH-->>H: ok
         H->>K: CommitMessages for the whole batch
     and
-        K->>I: poll(mobility-iceberg)
+        K->>I: poll(flight-iceberg)
         I->>I: buffer + Arrow RecordBatch
         I->>L: table.append(parquet)
         I->>K: commit offsets
@@ -102,10 +102,10 @@ sequenceDiagram
 
     Note over C,Q: read path
     C->>Q: GET /entities/vehicle/v7/position
-    Q->>PG: point read entity_positions
-    Q-->>C: 200 {lat, lon, event_ts, last_event_id}
+    Q->>PG: point read aircraft_state
+    Q-->>C: 200 {lat, lon, observed_at, last_event_id}
     C->>Q: GET /entities/vehicle/v7/events?limit=50
-    Q->>PG: row-wise keyset before cursor (event_ts, event_id)
+    Q->>PG: row-wise keyset before cursor (observed_at, event_id)
     Q-->>C: 200 {events[], next_cursor}
 ```
 
@@ -119,12 +119,12 @@ GROUP BY in Iceberg) make that replay a no-op.
 
 | # | Invariant | Enforced by |
 |---|---|---|
-| I1 | Every event has a unique `event_id` post-dedupe in Postgres | `raw_events.event_id PRIMARY KEY` + `ON CONFLICT DO NOTHING` |
-| I2 | `entity_positions.event_ts` equals `MAX(raw_events.event_ts)` per entity | `WHERE EXCLUDED.event_ts > entity_positions.event_ts` in the upsert |
+| I1 | Every event has a unique `event_id` post-dedupe in Postgres | `flight_telemetry.event_id PRIMARY KEY` + `ON CONFLICT DO NOTHING` |
+| I2 | `aircraft_state.observed_at` equals `MAX(flight_telemetry.observed_at)` per entity | `WHERE EXCLUDED.observed_at > aircraft_state.observed_at` in the upsert |
 | I3 | Kafka offset for a message advances only after its downstream write commits | `FetchMessage` → write → `CommitMessages`, with detached context for the commit so SIGTERM doesn't leave the last offset behind |
 | I4 | ClickHouse `event_count` per entity/hour (from `events_hourly_final`) equals distinct `event_id` count in the matching raw time range | `AggregatingMergeTree` with `uniqExactState(event_id)` + read-side `uniqExactMerge` |
-| I5 | Paginated events: every `event_id` is served at most once across pages, including events sharing the same microsecond | Composite `(event_ts, event_id)` cursor + row-wise `< (ts, id)` SQL + `ORDER BY event_ts DESC, event_id DESC` |
-| I6 | Per-entity ordering is preserved into each sink | Producer Murmur2 key = `entity_type:entity_id` → same partition → single consumer owns the partition → sequential reads |
+| I5 | Paginated events: every `event_id` is served at most once across pages, including events sharing the same microsecond | Composite `(observed_at, event_id)` cursor + row-wise `< (ts, id)` SQL + `ORDER BY observed_at DESC, event_id DESC` |
+| I6 | Per-entity ordering is preserved into each sink | Producer Murmur2 key = `icao24` → same partition → single consumer owns the partition → sequential reads |
 
 Integration tests (`internal/processor/store_test.go`, build tag
 `integration`) verify I1/I2 against a `testcontainers-go` Postgres. Unit
@@ -138,7 +138,7 @@ smoke below verifies all six together on a live stack.
 `internal/avro/movement_event.avsc`
 
 ```text
-record MovementEvent {
+record FlightTelemetry {
     event_id:    string  (logicalType=uuid),       // dedupe key across every sink
     entity_type: string,
     entity_id:   string,
@@ -156,20 +156,20 @@ binary payload.
 ### Postgres — hot state (`internal/processor/schema.sql`)
 
 ```sql
-raw_events (
+flight_telemetry (
     event_id    UUID PRIMARY KEY,
     entity_type TEXT, entity_id TEXT,
-    event_ts    TIMESTAMPTZ,
+    observed_at    TIMESTAMPTZ,
     lat, lon, speed_kmh, heading_deg, accuracy_m, source, attributes, ingested_at,
     CHECK (lat BETWEEN -90 AND 90), CHECK (lon BETWEEN -180 AND 180)
 );
-INDEX idx_raw_events_entity_ts (entity_type, entity_id, event_ts DESC);
+INDEX idx_flight_telemetry_entity_ts (entity_type, entity_id, observed_at DESC);
 
-entity_positions (
+aircraft_state (
     PRIMARY KEY (entity_type, entity_id),
-    event_ts, lat, lon, last_event_id, updated_at
+    observed_at, lat, lon, last_event_id, updated_at
 );
--- Upsert: WHERE EXCLUDED.event_ts > entity_positions.event_ts  (strict >)
+-- Upsert: WHERE EXCLUDED.observed_at > aircraft_state.observed_at  (strict >)
 ```
 
 Strict `>` on the position upsert discards stale events; `READ COMMITTED` +
@@ -178,23 +178,23 @@ the `WHERE` guard are sufficient under a single consumer.
 ### ClickHouse — analytics (`internal/chsink/schema.sql`)
 
 ```sql
-raw_events ReplacingMergeTree(event_ts)
-    ORDER BY (entity_type, entity_id, event_ts, event_id)
-    PARTITION BY toYYYYMM(event_ts);
+flight_telemetry ReplacingMergeTree(observed_at)
+    ORDER BY (entity_type, entity_id, observed_at, event_id)
+    PARTITION BY toYYYYMM(observed_at);
 
 events_hourly AggregatingMergeTree
     ORDER BY (entity_type, entity_id, hour)
     TTL hour + INTERVAL 90 DAY DELETE;
 
 events_hourly_mv → events_hourly AS SELECT
-    entity_type, entity_id, toStartOfHour(event_ts) AS hour,
+    entity_type, entity_id, toStartOfHour(observed_at) AS hour,
     uniqExactState(event_id)  AS uniq_events,
     sumIf(speed_kmh, IS NOT NULL) AS sum_speed,
     countIf(speed_kmh IS NOT NULL) AS speed_count
-FROM raw_events GROUP BY entity_type, entity_id, hour;
+FROM flight_telemetry GROUP BY entity_type, entity_id, hour;
 
 -- Canonical read views (hide FINAL / argMax / uniqExactMerge from callers)
-raw_events_final    = SELECT * FROM raw_events FINAL
+flight_telemetry_final    = SELECT * FROM flight_telemetry FINAL
 events_hourly_final = uniqExactMerge + sum_speed/speed_count
 ```
 
@@ -205,9 +205,9 @@ query time so counts match Postgres.
 
 ### Iceberg — long-term lake (`services/archiver/archiver.py`)
 
-- Table: `mobility.raw_events`, 12 columns, explicit IDs 1–12 for schema
+- Table: `mobility.flight_telemetry`, 12 columns, explicit IDs 1–12 for schema
   evolution.
-- Partition spec: `days(event_ts)` (hidden) + `identity(entity_type)`.
+- Partition spec: `days(observed_at)` (hidden) + `identity(entity_type)`.
 - At-least-once, dedup-at-read-time by `event_id` (Iceberg has no native
   uniqueness).
 - Storage: `s3://lake/` on MinIO; Iceberg REST catalog is the metadata
@@ -254,17 +254,17 @@ After running the generator burst above, the six invariants should all hold:
 
 ```sql
 -- I1: Postgres dedupe
-SELECT COUNT(*) AS total, COUNT(DISTINCT event_id) AS distinct FROM raw_events;
+SELECT COUNT(*) AS total, COUNT(DISTINCT event_id) AS distinct FROM flight_telemetry;
 
--- I2: out-of-order gate — every entity's position matches the max raw event_ts
+-- I2: out-of-order gate — every entity's position matches the max raw observed_at
 SELECT r.entity_type, r.entity_id,
-       MAX(r.event_ts) AS max_raw, p.event_ts AS pos,
-       (MAX(r.event_ts) = p.event_ts) AS ok
-FROM raw_events r JOIN entity_positions p USING (entity_type, entity_id)
-GROUP BY r.entity_type, r.entity_id, p.event_ts;
+       MAX(r.observed_at) AS max_raw, p.observed_at AS pos,
+       (MAX(r.observed_at) = p.observed_at) AS ok
+FROM flight_telemetry r JOIN aircraft_state p USING (entity_type, entity_id)
+GROUP BY r.entity_type, r.entity_id, p.observed_at;
 
 -- I4: ClickHouse distinct count parity with Postgres
-SELECT count(), uniqExact(event_id) FROM mobility.raw_events_final;
+SELECT count(), uniqExact(event_id) FROM mobility.flight_telemetry_final;
 SELECT entity_type, entity_id, hour, event_count, avg_speed_kmh
 FROM mobility.events_hourly_final ORDER BY entity_type, entity_id, hour;
 ```
@@ -312,8 +312,8 @@ All services read env vars via `internal/config`.
 | `QUERY_HTTP_PORT` | query-api | `8090` | HTTP listen |
 | `PROM_PORT` | all Go services | `9464`/`9465`/`9466`/`9467` | Prometheus `/metrics` port (per service) |
 | `KAFKA_BROKERS` | all | `localhost:29092` | Comma-separated bootstrap list |
-| `KAFKA_TOPIC` | all | `movement.events` | Source topic |
-| `KAFKA_GROUP_ID` | stream-processor / clickhouse-sink | `mobility-postgres` / `mobility-clickhouse` | Consumer group |
+| `KAFKA_TOPIC` | all | `flight.telemetry` | Source topic |
+| `KAFKA_GROUP_ID` | stream-processor / clickhouse-sink | `flight-postgres` / `flight-clickhouse` | Consumer group |
 | `SCHEMA_REGISTRY_URL` | ingest-api | `http://localhost:8081` | SR endpoint |
 | `POSTGRES_DSN` | stream-processor / query-api | `postgres://postgres:postgres@localhost:5432/mobility?sslmode=disable` | DSN; **logged with password stripped** via `config.RedactDSN` |
 | `CLICKHOUSE_ADDR` / `CLICKHOUSE_DB` | clickhouse-sink | `localhost:9000` / `mobility` | Native protocol |
@@ -333,7 +333,7 @@ override-able via `pool_*` DSN params.
 | Message bus | Apache Kafka (KRaft) | Replay, decoupling, partitioned ordering |
 | Schema | Avro + Confluent Schema Registry | Evolution + compact wire format |
 | Stream processor | Plain Go consumer (segmentio/kafka-go) | No JVM runtime; state lives in Postgres |
-| Hot-state store | Postgres 16 | Atomic dedupe + `event_ts`-gated upsert in one `ON CONFLICT` transaction |
+| Hot-state store | Postgres 16 | Atomic dedupe + `observed_at`-gated upsert in one `ON CONFLICT` transaction |
 | Analytical store | ClickHouse | Columnar scans; `ReplacingMergeTree` for dedupe; `AggregatingMergeTree` MV stays correct under redelivery |
 | Lake storage | MinIO + Apache Iceberg + Parquet | Long retention, schema-evolution, DuckDB/Trino-friendly |
 | Python role | Event generator + Iceberg archiver + DuckDB CLI | PyIceberg is more ergonomic than Go for Iceberg writes |
@@ -384,7 +384,7 @@ Built phase-by-phase. Each phase closed with an
 | 0 | Repo scaffold + compose + Python generator | — |
 | 1 | Avro schema + Go codegen | — |
 | 2 | Ingestion API + Kafka producer (SR wire format) | Producer registered a stripped schema variant; broken `v2` in SR blocking evolution — fixed via embedded canonical `.avsc`. |
-| 3 | Stream processor → Postgres | Detached commit context, fetch backoff, decode-failures counter, `event_ts` column rename, lat/lon CHECK constraints. |
+| 3 | Stream processor → Postgres | Detached commit context, fetch backoff, decode-failures counter, `observed_at` column rename, lat/lon CHECK constraints. |
 | 4 | Query API (composite-cursor pagination) | Keyset pagination tie-break (composite cursor), pool config, per-query timeouts, JSONB as `json.RawMessage`. |
 | 5 | ClickHouse sink + hourly rollup MV | Batch-aligned offset commit (offsets moved into the consumer loop; was a silent data-loss path), `AggregatingMergeTree` + `uniqExactState` for dedupe-safe counts. |
 | 6 | PyIceberg archiver + DuckDB CLI | Narrowed `except Exception` swallow, catalog-token support, removed hardcoded creds, secret guardrails in lake-query. |
@@ -438,7 +438,7 @@ make sr-state -- --probe-evolution                              # BACKWARD-compa
 
 ## Troubleshooting
 
-- **`make up` hangs on a service**: `docker compose -f deploy/docker-compose.yml -p dream-mobility logs <service>`. Healthchecks have generous timeouts but a wedged container will block `--wait`.
+- **`make up` hangs on a service**: `docker compose -f deploy/docker-compose.yml -p dream-flight logs <service>`. Healthchecks have generous timeouts but a wedged container will block `--wait`.
 - **Port already in use**: most likely Postgres (5432), ClickHouse (9000 native), MinIO (9100), or a Prometheus port (9464–9467) from a stray `go run`. `lsof -ti:<port> | xargs kill` clears it.
 - **ClickHouse sink won't start — "Database mobility does not exist"**: the compose volume is from an older schema. Run `make down-v && make up` to rebuild.
 - **Wipe everything and start fresh**: `make down-v && make up`.

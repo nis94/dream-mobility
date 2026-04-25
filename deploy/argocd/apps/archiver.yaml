@@ -1,18 +1,18 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: dm-archiver
+  name: df-archiver
   namespace: argocd
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
   project: default
   source:
-    repoURL: https://github.com/nis94/dream-mobility.git
+    repoURL: https://github.com/nis94/dream-flight.git
     targetRevision: main
     path: deploy/helm/archiver
     helm:
-      releaseName: dm-archiver
+      releaseName: df-archiver
       valueFiles:
         - values.yaml
         - values-kind.yaml

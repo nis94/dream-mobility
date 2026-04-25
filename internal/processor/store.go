@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	avroschema "github.com/nis94/dream-mobility/internal/avro"
+	avroschema "github.com/nis94/dream-flight/internal/avro"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -82,22 +82,23 @@ func (s *Store) Close() {
 
 // InsertResult describes the outcome of inserting a single event.
 type InsertResult struct {
-	RawInserted     bool // false if duplicate (ON CONFLICT DO NOTHING)
-	PositionUpdated bool // false if existing position had a newer event_ts
+	RawInserted  bool // false if duplicate (ON CONFLICT DO NOTHING)
+	StateUpdated bool // false if existing aircraft_state row had a newer observed_at
 }
 
-// InsertEvent atomically inserts the raw event (deduplicated) and upserts
-// the entity position (timestamp-gated). Both statements run in one
+// InsertEvent atomically inserts the raw observation (deduplicated) and
+// upserts the aircraft_state (timestamp-gated). Both statements run in one
 // transaction so the offset is only committed on full success.
 //
-// Tie semantics: the position upsert uses strict `>`, so on equal event_ts
-// the existing row wins. A future ClickHouse ReplacingMergeTree sink MUST
-// use `version = event_ts` to keep the two stores consistent.
-func (s *Store) InsertEvent(ctx context.Context, ev *avroschema.MovementEvent) (InsertResult, error) {
+// Tie semantics: the state upsert uses strict `>`, so on equal observed_at
+// the existing row wins. The ClickHouse ReplacingMergeTree sink MUST use
+// `version = observed_at` to keep the two stores consistent.
+func (s *Store) InsertEvent(ctx context.Context, ev *avroschema.FlightTelemetry) (InsertResult, error) {
 	ctx, span := tracer.Start(ctx, "postgres.insert_event",
 		trace.WithAttributes(
 			attribute.String("event.id", ev.EventID),
-			attribute.String("entity.type", ev.EntityType),
+			attribute.String("aircraft.icao24", ev.Icao24),
+			attribute.String("aircraft.origin_country", ev.OriginCountry),
 		),
 	)
 	defer span.End()
@@ -110,64 +111,71 @@ func (s *Store) InsertEvent(ctx context.Context, ev *avroschema.MovementEvent) (
 		span.RecordError(err)
 		return result, fmt.Errorf("begin tx: %w", err)
 	}
-	// Use a detached context for rollback: if the request ctx was cancelled
-	// mid-commit, we still want the rollback RPC to reach the server.
-	// Rollback on an already-committed tx is a documented no-op.
+	// Detached rollback: if the request ctx was cancelled mid-commit, we
+	// still want the rollback RPC to reach the server. Rollback on an
+	// already-committed tx is a documented no-op.
 	defer func() { _ = tx.Rollback(context.Background()) }()
 
-	// 1) Raw event insert — dedupe by event_id.
-	rawCtx, rawSpan := tracer.Start(ctx, "pg.insert raw_events")
+	// 1) Raw observation insert — dedupe by event_id.
+	rawCtx, rawSpan := tracer.Start(ctx, "pg.insert flight_telemetry")
 	tag, err := tx.Exec(rawCtx, `
-		INSERT INTO raw_events (
-			event_id, entity_type, entity_id, event_ts,
-			lat, lon, speed_kmh, heading_deg, accuracy_m,
-			source, attributes
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		INSERT INTO flight_telemetry (
+			event_id, icao24, callsign, origin_country, observed_at, position_source,
+			lat, lon, baro_altitude_m, geo_altitude_m, velocity_ms, true_track_deg,
+			vertical_rate_ms, on_ground, squawk, spi, category
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
 		ON CONFLICT (event_id) DO NOTHING`,
-		ev.EventID, ev.EntityType, ev.EntityID, ev.Timestamp,
-		ev.Lat, ev.Lon, ev.SpeedKmh, ev.HeadingDeg, ev.AccuracyM,
-		ev.Source, attributesToJSONB(ev.Attributes),
+		ev.EventID, ev.Icao24, ev.Callsign, ev.OriginCountry, ev.ObservedAt, ev.PositionSource,
+		ev.Lat, ev.Lon, ev.BaroAltitudeM, ev.GeoAltitudeM, ev.VelocityMs, ev.TrueTrackDeg,
+		ev.VerticalRateMs, ev.OnGround, ev.Squawk, ev.Spi, ev.Category,
 	)
 	if err != nil {
-		rawSpan.SetStatus(codes.Error, "insert raw_events")
+		rawSpan.SetStatus(codes.Error, "insert flight_telemetry")
 		rawSpan.RecordError(err)
 		rawSpan.End()
-		span.SetStatus(codes.Error, "insert raw_events")
-		return result, fmt.Errorf("insert raw_events: %w", err)
+		span.SetStatus(codes.Error, "insert flight_telemetry")
+		return result, fmt.Errorf("insert flight_telemetry: %w", err)
 	}
 	result.RawInserted = tag.RowsAffected() > 0
 	rawSpan.SetAttributes(attribute.Bool("pg.raw_inserted", result.RawInserted))
 	rawSpan.End()
 
-	// 2) Entity position upsert — timestamp-gated.
-	// The WHERE clause ensures a stale (out-of-order) event does NOT
-	// overwrite a position that already has a more recent event_ts.
-	posCtx, posSpan := tracer.Start(ctx, "pg.upsert entity_positions")
-	tag, err = tx.Exec(posCtx, `
-		INSERT INTO entity_positions (
-			entity_type, entity_id, event_ts, lat, lon, last_event_id
-		) VALUES ($1,$2,$3,$4,$5,$6)
-		ON CONFLICT (entity_type, entity_id)
+	// 2) aircraft_state upsert — timestamp-gated.
+	// The WHERE clause ensures a stale (out-of-order) observation does NOT
+	// overwrite a state row that already has a more recent observed_at.
+	stateCtx, stateSpan := tracer.Start(ctx, "pg.upsert aircraft_state")
+	tag, err = tx.Exec(stateCtx, `
+		INSERT INTO aircraft_state (
+			icao24, last_callsign, origin_country, observed_at,
+			lat, lon, baro_altitude_m, velocity_ms, on_ground, last_squawk, last_event_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		ON CONFLICT (icao24)
 		DO UPDATE SET
-			event_ts      = EXCLUDED.event_ts,
-			lat           = EXCLUDED.lat,
-			lon           = EXCLUDED.lon,
-			last_event_id = EXCLUDED.last_event_id,
-			updated_at    = now()
-		WHERE EXCLUDED.event_ts > entity_positions.event_ts`,
-		ev.EntityType, ev.EntityID, ev.Timestamp,
-		ev.Lat, ev.Lon, ev.EventID,
+			last_callsign   = EXCLUDED.last_callsign,
+			origin_country  = EXCLUDED.origin_country,
+			observed_at     = EXCLUDED.observed_at,
+			lat             = EXCLUDED.lat,
+			lon             = EXCLUDED.lon,
+			baro_altitude_m = EXCLUDED.baro_altitude_m,
+			velocity_ms     = EXCLUDED.velocity_ms,
+			on_ground       = EXCLUDED.on_ground,
+			last_squawk     = EXCLUDED.last_squawk,
+			last_event_id   = EXCLUDED.last_event_id,
+			updated_at      = now()
+		WHERE EXCLUDED.observed_at > aircraft_state.observed_at`,
+		ev.Icao24, ev.Callsign, ev.OriginCountry, ev.ObservedAt,
+		ev.Lat, ev.Lon, ev.BaroAltitudeM, ev.VelocityMs, ev.OnGround, ev.Squawk, ev.EventID,
 	)
 	if err != nil {
-		posSpan.SetStatus(codes.Error, "upsert entity_positions")
-		posSpan.RecordError(err)
-		posSpan.End()
-		span.SetStatus(codes.Error, "upsert entity_positions")
-		return result, fmt.Errorf("upsert entity_positions: %w", err)
+		stateSpan.SetStatus(codes.Error, "upsert aircraft_state")
+		stateSpan.RecordError(err)
+		stateSpan.End()
+		span.SetStatus(codes.Error, "upsert aircraft_state")
+		return result, fmt.Errorf("upsert aircraft_state: %w", err)
 	}
-	result.PositionUpdated = tag.RowsAffected() > 0
-	posSpan.SetAttributes(attribute.Bool("pg.position_updated", result.PositionUpdated))
-	posSpan.End()
+	result.StateUpdated = tag.RowsAffected() > 0
+	stateSpan.SetAttributes(attribute.Bool("pg.state_updated", result.StateUpdated))
+	stateSpan.End()
 
 	if err := tx.Commit(ctx); err != nil {
 		span.SetStatus(codes.Error, "commit")
@@ -176,16 +184,7 @@ func (s *Store) InsertEvent(ctx context.Context, ev *avroschema.MovementEvent) (
 	}
 	span.SetAttributes(
 		attribute.Bool("pg.raw_inserted", result.RawInserted),
-		attribute.Bool("pg.position_updated", result.PositionUpdated),
+		attribute.Bool("pg.state_updated", result.StateUpdated),
 	)
 	return result, nil
-}
-
-// attributesToJSONB converts the optional JSON-string attributes field to
-// a value suitable for the JSONB column. Returns nil (SQL NULL) when absent.
-func attributesToJSONB(s *string) any {
-	if s == nil || *s == "" {
-		return nil
-	}
-	return *s // pgx automatically maps string → JSONB
 }

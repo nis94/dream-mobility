@@ -5,16 +5,16 @@ import (
 	"fmt"
 
 	"github.com/hamba/avro/v2"
-	avroschema "github.com/nis94/dream-mobility/internal/avro"
+	avroschema "github.com/nis94/dream-flight/internal/avro"
 )
 
-// DecodeMovementEvent is the exported entry point for other consumers
+// DecodeFlightTelemetry is the exported entry point for other consumers
 // (e.g. the ClickHouse sink) that share the same Kafka topic.
-func DecodeMovementEvent(data []byte) (*avroschema.MovementEvent, error) {
-	return decodeMovementEvent(data)
+func DecodeFlightTelemetry(data []byte) (*avroschema.FlightTelemetry, error) {
+	return decodeFlightTelemetry(data)
 }
 
-// decodeMovementEvent strips the Confluent Schema Registry wire format
+// decodeFlightTelemetry strips the Confluent Schema Registry wire format
 // (magic byte + 4-byte schema ID) and deserializes the Avro payload.
 //
 // Wire format:
@@ -23,7 +23,7 @@ func DecodeMovementEvent(data []byte) (*avroschema.MovementEvent, error) {
 //	bytes 1-4: schema ID (big-endian uint32) — ignored here; we trust the
 //	           topic-level subject binding.
 //	bytes 5+:  Avro binary data
-func decodeMovementEvent(data []byte) (*avroschema.MovementEvent, error) {
+func decodeFlightTelemetry(data []byte) (*avroschema.FlightTelemetry, error) {
 	if len(data) < 6 { // 5-byte header + at least 1 byte payload
 		return nil, fmt.Errorf("message too short (%d bytes)", len(data))
 	}
@@ -33,7 +33,7 @@ func decodeMovementEvent(data []byte) (*avroschema.MovementEvent, error) {
 
 	_ = binary.BigEndian.Uint32(data[1:5]) // schema ID (logged if needed)
 
-	var event avroschema.MovementEvent
+	var event avroschema.FlightTelemetry
 	if err := avro.Unmarshal(event.Schema(), data[5:], &event); err != nil {
 		return nil, fmt.Errorf("avro unmarshal: %w", err)
 	}

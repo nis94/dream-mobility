@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nis94/dream-mobility/internal/kafkametrics"
-	"github.com/nis94/dream-mobility/internal/tracing"
+	"github.com/nis94/dream-flight/internal/kafkametrics"
+	"github.com/nis94/dream-flight/internal/tracing"
 	"github.com/segmentio/kafka-go"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -17,7 +17,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-var tracer = otel.Tracer("github.com/nis94/dream-mobility/internal/processor")
+var tracer = otel.Tracer("github.com/nis94/dream-flight/internal/processor")
 
 // commitTimeout bounds the detached CommitMessages call during shutdown.
 // The request context may already be cancelled; we still want the offset
@@ -134,7 +134,7 @@ func (p *Processor) processMessage(ctx context.Context, msg kafka.Message) error
 	)
 	defer span.End()
 
-	event, err := decodeMovementEvent(msg.Value)
+	event, err := decodeFlightTelemetry(msg.Value)
 	if err != nil {
 		if p.metrics != nil {
 			p.metrics.IncDecodeFailure()
@@ -151,8 +151,8 @@ func (p *Processor) processMessage(ctx context.Context, msg kafka.Message) error
 	}
 	span.SetAttributes(
 		attribute.String("event.id", event.EventID),
-		attribute.String("entity.type", event.EntityType),
-		attribute.String("entity.id", event.EntityID),
+		attribute.String("aircraft.icao24", event.Icao24),
+		attribute.String("aircraft.origin_country", event.OriginCountry),
 	)
 
 	start := time.Now()
@@ -164,15 +164,15 @@ func (p *Processor) processMessage(ctx context.Context, msg kafka.Message) error
 	}
 	span.SetAttributes(
 		attribute.Bool("pg.raw_inserted", result.RawInserted),
-		attribute.Bool("pg.position_updated", result.PositionUpdated),
+		attribute.Bool("pg.state_updated", result.StateUpdated),
 	)
 
 	p.logger.Debug("event processed",
 		"event_id", event.EventID,
-		"entity_type", event.EntityType,
-		"entity_id", event.EntityID,
+		"icao24", event.Icao24,
+		"origin_country", event.OriginCountry,
 		"raw_inserted", result.RawInserted,
-		"position_updated", result.PositionUpdated,
+		"state_updated", result.StateUpdated,
 		"duration", time.Since(start),
 	)
 	return nil

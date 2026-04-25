@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: dream-mobility/ingest-api
+  repository: dream-flight/ingest-api
   # tag defaults to Chart.AppVersion when unset — keeps image + chart in lockstep.
   tag: ""
   pullPolicy: IfNotPresent

@@ -1,48 +1,71 @@
--- 001_init.sql — Core schema for the movement intelligence pipeline.
+-- 001_init.sql — Postgres schema for the Dream Flight pipeline.
 --
--- raw_events:       append-only, deduped by event_id via ON CONFLICT DO NOTHING.
--- entity_positions: last-known position per entity, updated by a timestamp-gated
---                   upsert (newer event_ts always wins; out-of-order events are
---                   silently discarded).
+-- flight_telemetry: append-only, deduplicated by event_id via ON CONFLICT DO NOTHING.
+--                   Stores every observation; one row per (icao24, observed_at, event_id).
+-- aircraft_state:   last-known state per aircraft, updated by a timestamp-gated
+--                   upsert (newer observed_at always wins; out-of-order events
+--                   are silently discarded — the existing row is more recent).
 --
--- Column name note: the event timestamp is stored as `event_ts`, not
--- `timestamp`. `timestamp` is a reserved SQL type keyword; using it as a
--- column name works in PostgreSQL today but is rejected by stricter SQL
--- dialects and linters (sqlfluff, etc.). The Avro field remains named
--- `timestamp`; the Go struct `MovementEvent.Timestamp` maps to this column
--- positionally in the INSERT statements.
+-- The Avro field timestamp is named `observed_at` here (not `timestamp`) since
+-- `timestamp` is a reserved SQL type keyword and rejected by stricter linters.
 
-CREATE TABLE IF NOT EXISTS raw_events (
-    event_id    UUID            PRIMARY KEY,
-    entity_type TEXT            NOT NULL,
-    entity_id   TEXT            NOT NULL,
-    event_ts    TIMESTAMPTZ     NOT NULL,
-    lat         DOUBLE PRECISION NOT NULL CHECK (lat BETWEEN -90 AND 90),
-    lon         DOUBLE PRECISION NOT NULL CHECK (lon BETWEEN -180 AND 180),
-    speed_kmh   DOUBLE PRECISION,
-    heading_deg DOUBLE PRECISION,
-    accuracy_m  DOUBLE PRECISION,
-    source      TEXT,
-    attributes  JSONB,
-    ingested_at TIMESTAMPTZ     NOT NULL DEFAULT now()
+CREATE TABLE IF NOT EXISTS flight_telemetry (
+    event_id         UUID            PRIMARY KEY,
+    icao24           TEXT            NOT NULL,
+    callsign         TEXT,
+    origin_country   TEXT            NOT NULL,
+    observed_at      TIMESTAMPTZ     NOT NULL,
+    position_source  TEXT            NOT NULL,
+    lat              DOUBLE PRECISION NOT NULL CHECK (lat BETWEEN -90 AND 90),
+    lon              DOUBLE PRECISION NOT NULL CHECK (lon BETWEEN -180 AND 180),
+    baro_altitude_m  DOUBLE PRECISION,
+    geo_altitude_m   DOUBLE PRECISION,
+    velocity_ms      DOUBLE PRECISION,
+    true_track_deg   DOUBLE PRECISION,
+    vertical_rate_ms DOUBLE PRECISION,
+    on_ground        BOOLEAN         NOT NULL,
+    squawk           TEXT,
+    spi              BOOLEAN         NOT NULL,
+    category         SMALLINT,
+    ingested_at      TIMESTAMPTZ     NOT NULL DEFAULT now()
 );
 
--- Covers lookups by entity + time range (Query API Phase 4).
-CREATE INDEX IF NOT EXISTS idx_raw_events_entity_ts
-    ON raw_events (entity_type, entity_id, event_ts DESC);
+-- Per-aircraft trajectory queries: "all observations for icao24 X over the
+-- last hour". Descending observed_at supports the trivial LIMIT N most-recent
+-- pattern.
+CREATE INDEX IF NOT EXISTS idx_flight_telemetry_icao24_observed_at
+    ON flight_telemetry (icao24, observed_at DESC);
 
--- Tie semantics for the upsert below: the WHERE clause uses strict `>`, so
--- on equal event_ts the existing row wins and its last_event_id is retained.
--- Any future sink replicating this state (ClickHouse ReplacingMergeTree,
--- Iceberg MERGE) MUST use `version = event_ts` and the same tiebreak rule
--- to stay consistent.
-CREATE TABLE IF NOT EXISTS entity_positions (
-    entity_type   TEXT            NOT NULL,
-    entity_id     TEXT            NOT NULL,
-    event_ts      TIMESTAMPTZ     NOT NULL,
-    lat           DOUBLE PRECISION NOT NULL CHECK (lat BETWEEN -90 AND 90),
-    lon           DOUBLE PRECISION NOT NULL CHECK (lon BETWEEN -180 AND 180),
-    last_event_id UUID            NOT NULL,
-    updated_at    TIMESTAMPTZ     NOT NULL DEFAULT now(),
-    PRIMARY KEY (entity_type, entity_id)
+-- Country-scoped queries: "all UK aircraft observed in the last 5 minutes".
+-- Drives the country leaderboard panels in Grafana.
+CREATE INDEX IF NOT EXISTS idx_flight_telemetry_country_observed_at
+    ON flight_telemetry (origin_country, observed_at DESC);
+
+-- aircraft_state: latest known state per aircraft. The query-api's
+-- /flights/active and /flights/by-country endpoints read directly from this
+-- table — point lookups that don't need to scan flight_telemetry.
+--
+-- Tie semantics: the upsert below uses strict `>`, so on equal observed_at
+-- the existing row wins and its last_event_id is retained. The ClickHouse
+-- ReplacingMergeTree mirror MUST use `version = observed_at` and the same
+-- tiebreak rule to stay consistent.
+CREATE TABLE IF NOT EXISTS aircraft_state (
+    icao24          TEXT            PRIMARY KEY,
+    last_callsign   TEXT,
+    origin_country  TEXT            NOT NULL,
+    observed_at     TIMESTAMPTZ     NOT NULL,
+    lat             DOUBLE PRECISION NOT NULL CHECK (lat BETWEEN -90 AND 90),
+    lon             DOUBLE PRECISION NOT NULL CHECK (lon BETWEEN -180 AND 180),
+    baro_altitude_m DOUBLE PRECISION,
+    velocity_ms     DOUBLE PRECISION,
+    on_ground       BOOLEAN         NOT NULL,
+    last_squawk     TEXT,
+    last_event_id   UUID            NOT NULL,
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT now()
 );
+
+-- "Active aircraft" panels filter aircraft_state on observed_at within a
+-- short rolling window. The covering index on observed_at lets that scan
+-- skip the heap entirely.
+CREATE INDEX IF NOT EXISTS idx_aircraft_state_observed_at
+    ON aircraft_state (observed_at DESC);

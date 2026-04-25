@@ -1,7 +1,7 @@
 SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
 
-COMPOSE := docker compose -f deploy/docker-compose.yml -p dream-mobility
+COMPOSE := docker compose -f deploy/docker-compose.yml -p dream-flight
 
 # ---- Help ---------------------------------------------------------------------
 
@@ -18,7 +18,7 @@ up: ## Bring up the local infra stack (Kafka, SR, Postgres, ClickHouse, MinIO, I
 	@echo "Stack is healthy. Endpoints:"
 	@echo "  Kafka broker (host):    localhost:29092"
 	@echo "  Schema Registry:        http://localhost:8081"
-	@echo "  Postgres:               postgres://postgres:postgres@localhost:5432/mobility"
+	@echo "  Postgres:               postgres://postgres:postgres@localhost:5432/flight"
 	@echo "  ClickHouse HTTP:        http://localhost:8123  (default user, no password)"
 	@echo "  ClickHouse native:      tcp://localhost:9000"
 	@echo "  MinIO API:              http://localhost:9100  (minioadmin/minioadmin)"

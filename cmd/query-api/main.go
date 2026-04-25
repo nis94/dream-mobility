@@ -14,9 +14,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/nis94/dream-mobility/internal/config"
-	otelinit "github.com/nis94/dream-mobility/internal/otel"
-	"github.com/nis94/dream-mobility/internal/query"
+	"github.com/nis94/dream-flight/internal/config"
+	otelinit "github.com/nis94/dream-flight/internal/otel"
+	"github.com/nis94/dream-flight/internal/query"
 )
 
 const (
@@ -84,9 +84,12 @@ func run(logger *slog.Logger) error {
 		_, _ = io.WriteString(w, "ok")
 	})
 
-	r.Route("/entities/{type}/{id}", func(r chi.Router) {
-		r.Get("/position", h.GetPosition)
-		r.Get("/events", h.ListEvents)
+	// Aviation endpoints. The /aircraft routes operate on a single icao24;
+	// /flights/active is the leaderboard-style listing fed by aircraft_state.
+	r.Get("/flights/active", h.ListActive)
+	r.Route("/aircraft/{icao24}", func(r chi.Router) {
+		r.Get("/", h.GetAircraft)
+		r.Get("/track", h.GetTrack)
 	})
 
 	srv := &http.Server{

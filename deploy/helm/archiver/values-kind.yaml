@@ -8,8 +8,8 @@ image:
 
 env:
   KAFKA_BROKERS: "host.docker.internal:39092"
-  KAFKA_TOPIC: "movement.events"
-  KAFKA_GROUP_ID: "mobility-iceberg"
+  KAFKA_TOPIC: "flight.telemetry"
+  KAFKA_GROUP_ID: "flight-iceberg"
   ICEBERG_CATALOG_URI: "http://host.docker.internal:8181"
   ICEBERG_WAREHOUSE: "s3://lake/"
   S3_ENDPOINT: "http://host.docker.internal:9100"

@@ -1,4 +1,4 @@
-# Dream Mobility — a tour
+# Dream Flight — a tour
 
 A story-shaped walkthrough of the whole system: what we built, why we
 picked each tool, and what role each piece plays. Read top to bottom in
@@ -47,7 +47,7 @@ pipeline is at-least-once end to end — if anything crashes and a
 message is redelivered, the write is a no-op.
 
 ```
-HTTP → ingest-api → Kafka (movement.events, 3 partitions)
+HTTP → ingest-api → Kafka (flight.telemetry, 3 partitions)
                       │
           ┌───────────┼───────────┐
           ▼           ▼           ▼
@@ -79,7 +79,7 @@ more — no DB writes, no business logic, just "get bytes off the wire
 and onto the bus as fast as possible."
 
 **`stream-processor`** — the Postgres writer. Reads Kafka, inserts into
-`raw_events` (dedupe by `event_id`), upserts `entity_positions` with a
+`flight_telemetry` (dedupe by `event_id`), upserts `aircraft_state` with a
 timestamp guard so out-of-order events don't regress the last-known
 position. Kafka offset advances only after the Postgres transaction
 commits; a crash replays the last message and idempotence absorbs it.
@@ -92,7 +92,7 @@ ClickHouse hates single-row inserts. Offsets commit per batch.
 **`query-api`** — the read-side HTTP service. Reads Postgres only.
 Exposes `GET /entities/{type}/{id}/position` (single point read) and
 `/events` (paginated reverse-chronological history). The pagination
-cursor is composite `(event_ts, event_id)` so ties within the same
+cursor is composite `(observed_at, event_id)` so ties within the same
 microsecond don't duplicate rows across pages.
 
 All four are plain stdlib-ish Go — the only real frameworks are
@@ -140,7 +140,7 @@ single point that guarantees:
   (say, a "recompute the last 30 days into a new store") that reads
   from the earliest offset. No need to re-ingest from the source.
 - **Partitioned ordering**. Kafka guarantees total order *within a
-  partition*. We key every message by `entity_type:entity_id` using
+  partition*. We key every message by `icao24` using
   the Murmur2 partitioner, so all events for vehicle-7 hit the same
   partition, which means they're delivered in the order they were
   produced, which means out-of-order events (real-world issue on
@@ -197,8 +197,8 @@ the returned ID); consumers resolve ID → schema lazily.
 Role: point reads, small range scans, "what's the current state of
 entity X?"
 
-We use Postgres 16 with two tables: `raw_events` (dedupe PK on
-`event_id`) and `entity_positions` (one row per entity, timestamp-gated
+We use Postgres 16 with two tables: `flight_telemetry` (dedupe PK on
+`event_id`) and `aircraft_state` (one row per entity, timestamp-gated
 upsert). The stream-processor writes both in a single transaction, so
 the offset only advances after we've durably committed both writes.
 
@@ -209,7 +209,7 @@ Why Postgres and not, say, Redis or Cassandra?
 - **Familiar**. Every backend engineer speaks Postgres. It is the
   least-surprising choice.
 - **Indexing for our access patterns is trivial**. The hot read is
-  a keyset pagination on `(entity_type, entity_id, event_ts DESC,
+  a keyset pagination on `(entity_type, entity_id, observed_at DESC,
   event_id DESC)` — one composite index, done.
 
 What Postgres is bad at, and why we didn't pick it for everything:
@@ -228,10 +228,10 @@ column is ~10× cheaper than in a row store like Postgres.
 
 Two design choices worth calling out:
 
-- **`ReplacingMergeTree` with `event_ts` as the version** on the raw
+- **`ReplacingMergeTree` with `observed_at` as the version** on the raw
   events table. This lets us ingest at-least-once safely: a
   re-delivered duplicate `event_id` is collapsed by a background
-  merge. Read queries use `FINAL` (via the `raw_events_final` view)
+  merge. Read queries use `FINAL` (via the `flight_telemetry_final` view)
   so callers never see the pre-merge duplicates.
 - **`AggregatingMergeTree` materialized view** `events_hourly_mv`
   that rolls raw events into hourly buckets at write time using
@@ -273,7 +273,7 @@ This split buys us:
 - **Time travel** — every write creates a snapshot. "Show me the
   table as of last Tuesday" is one SQL clause.
 - **Partitioning that's transparent to the caller** — a query with
-  `WHERE event_ts BETWEEN ...` automatically prunes Parquet files
+  `WHERE observed_at BETWEEN ...` automatically prunes Parquet files
   whose day-partition doesn't overlap the range.
 - **Zero vendor lock-in**. Any engine that speaks Iceberg reads
   these files; moving off MinIO to real S3 is a DNS change.
@@ -341,7 +341,7 @@ alerting.
 The single pane. One datasource per signal source: Prometheus for
 metrics, Jaeger for traces (wired via the Jaeger datasource so you
 can click through traces from time-series panels). We have a small
-hand-built dashboard (`Dream Mobility — Runtime`) showing
+hand-built dashboard (`Dream Flight — Runtime`) showing
 per-instance Go runtime state and scrape health.
 
 ### Jaeger
@@ -355,8 +355,8 @@ POST /events                (otelhttp middleware, ingest-api)
     kafka.produce           (injects traceparent into Kafka headers)
       kafka.consume         (extracts traceparent, in stream-processor)
         postgres.insert_event
-          pg.insert raw_events
-          pg.upsert entity_positions
+          pg.insert flight_telemetry
+          pg.upsert aircraft_state
 ```
 
 The W3C TraceContext rides in a Kafka message header, so the trace
@@ -507,10 +507,10 @@ appear in every box in the diagram.
 exactly-once across the pipeline because it would require expensive
 two-phase commits between Kafka and each sink. Instead we embrace
 duplicates at the wire level and make every sink reject them:
-- Postgres: `raw_events.event_id` is the primary key + `ON CONFLICT
+- Postgres: `flight_telemetry.event_id` is the primary key + `ON CONFLICT
   DO NOTHING`.
 - ClickHouse: `ReplacingMergeTree` keyed on `event_id` + the
-  `raw_events_final` view hides duplicates from readers.
+  `flight_telemetry_final` view hides duplicates from readers.
 - Iceberg: no native uniqueness, so we dedupe at read time via
   `SELECT DISTINCT ON (event_id)` or `COUNT(DISTINCT event_id)`.
 
@@ -521,7 +521,7 @@ last message; idempotence absorbs it. This is the whole reason the
 Kafka-offset invariant (I3 in the README) holds.
 
 **Kafka partition key = ordering lane.** By keying on
-`entity_type:entity_id`, every event for a given entity lands in the
+`icao24`, every event for a given entity lands in the
 same partition and is consumed by a single consumer instance in
 strict order. Scaling consumers horizontally (up to the partition
 count) keeps per-entity ordering intact — this is what makes the

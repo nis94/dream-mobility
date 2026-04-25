@@ -90,11 +90,11 @@ echo
 # Convention: <topic>-value for the value schema.
 # -----------------------------------------------------------
 
-register "movement.events-value" "${SCHEMAS_DIR}/movement_event.avsc"
+register "flight.telemetry-value" "${SCHEMAS_DIR}/flight_telemetry.avsc"
 
 # Pin subject-level compat so an operator cannot accidentally relax the
 # contract by changing the SR-wide default compatibility level.
-pin_compat "movement.events-value" "BACKWARD"
+pin_compat "flight.telemetry-value" "BACKWARD"
 
 echo
 echo "Done. Registered subjects:"

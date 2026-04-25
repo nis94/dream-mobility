@@ -1,18 +1,18 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: dm-ingest-api
+  name: df-ingest-api
   namespace: argocd
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
   project: default
   source:
-    repoURL: https://github.com/nis94/dream-mobility.git
+    repoURL: https://github.com/nis94/dream-flight.git
     targetRevision: main
     path: deploy/helm/ingest-api
     helm:
-      releaseName: dm-ingest-api
+      releaseName: df-ingest-api
       valueFiles:
         - values.yaml
         - values-kind.yaml

@@ -25,8 +25,8 @@ func TestRegisterSchema_Success(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("method = %s, want POST", r.Method)
 		}
-		if r.URL.Path != "/subjects/movement.events-value/versions" {
-			t.Errorf("path = %s, want /subjects/movement.events-value/versions", r.URL.Path)
+		if r.URL.Path != "/subjects/flight.telemetry-value/versions" {
+			t.Errorf("path = %s, want /subjects/flight.telemetry-value/versions", r.URL.Path)
 		}
 		if ct := r.Header.Get("Content-Type"); ct != "application/vnd.schemaregistry.v1+json" {
 			t.Errorf("Content-Type = %q, want application/vnd.schemaregistry.v1+json", ct)
@@ -36,7 +36,7 @@ func TestRegisterSchema_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	id, err := registerSchema(context.Background(), srv.URL, "movement.events-value", []byte(`{"type":"string"}`), newTestLogger())
+	id, err := registerSchema(context.Background(), srv.URL, "flight.telemetry-value", []byte(`{"type":"string"}`), newTestLogger())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

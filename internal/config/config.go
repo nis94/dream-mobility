@@ -54,12 +54,12 @@ func Load() (Config, error) {
 		HTTPPort:          envOrDefault("HTTP_PORT", "8080"),
 		QueryHTTPPort:     envOrDefault("QUERY_HTTP_PORT", "8090"),
 		KafkaBrokers:      brokers,
-		KafkaTopic:        envOrDefault("KAFKA_TOPIC", "movement.events"),
-		KafkaGroupID:      envOrDefault("KAFKA_GROUP_ID", "mobility-postgres"),
+		KafkaTopic:        envOrDefault("KAFKA_TOPIC", "flight.telemetry"),
+		KafkaGroupID:      envOrDefault("KAFKA_GROUP_ID", "flight-postgres"),
 		SchemaRegistryURL: envOrDefault("SCHEMA_REGISTRY_URL", "http://localhost:8081"),
-		PostgresDSN:       envOrDefault("POSTGRES_DSN", "postgres://postgres:postgres@localhost:5432/mobility?sslmode=disable"),
+		PostgresDSN:       envOrDefault("POSTGRES_DSN", "postgres://postgres:postgres@localhost:5432/flight?sslmode=disable"),
 		ClickHouseAddr:    envOrDefault("CLICKHOUSE_ADDR", "localhost:9000"),
-		ClickHouseDB:      envOrDefault("CLICKHOUSE_DB", "mobility"),
+		ClickHouseDB:      envOrDefault("CLICKHOUSE_DB", "flight"),
 	}, nil
 }
 

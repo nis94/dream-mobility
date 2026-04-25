@@ -41,15 +41,15 @@ loopback interface. To enable anonymous MinIO read on the lake bucket
 
 ## Kafka partitioning dictates scale-out
 
-- Topic `movement.events` has **3 partitions**. Per consumer group, at
+- Topic `flight.telemetry` has **3 partitions**. Per consumer group, at
   most 3 instances consume in parallel; a 4th sits idle with
   `#PARTITIONS = 0` (verify with
   `kafka-consumer-groups --describe --group <g> --members`).
-- The three sinks (`mobility-postgres`, `mobility-clickhouse`,
-  `mobility-iceberg`) are **independent consumer groups** and scale
+- The three sinks (`flight-postgres`, `flight-clickhouse`,
+  `flight-iceberg`) are **independent consumer groups** and scale
   independently.
 - Per-entity ordering (invariant I6) holds under scale-out because the
-  producer keys on `entity_type:entity_id` — same key → same partition
+  producer keys on `icao24` — same key → same partition
   → single consumer.
 
 ## Kubernetes / GitOps layout
@@ -82,7 +82,7 @@ loopback interface. To enable anonymous MinIO read on the lake bucket
 
 - Opt-in overlay compose:
   `docker compose -f deploy/docker-compose.yml
-  -f deploy/observability/docker-compose.observability.yml -p dream-mobility up -d`.
+  -f deploy/observability/docker-compose.observability.yml -p dream-flight up -d`.
 - OTel SDK is initialized in every `cmd/*/main.go`. The OTLP/HTTP
   exporter **must** use `otlptracehttp.WithInsecure()` against the
   local collector (the SDK defaults to HTTPS otherwise and every
@@ -98,9 +98,9 @@ loopback interface. To enable anonymous MinIO read on the lake bucket
   continues the trace into Iceberg writes — one trace ID now spans
   Go→Go→Python. clickhouse-sink is not yet instrumented.
 - Prometheus is reachable from Grafana at
-  `http://dm-prometheus:9090` (the docker-network hostname), not
+  `http://df-prometheus:9090` (the docker-network hostname), not
   `localhost`. Jaeger is reachable the same way at
-  `http://dm-jaeger:16686`. Datasources are provisioned by hand
+  `http://df-jaeger:16686`. Datasources are provisioned by hand
   today (`curl -u admin:admin -X POST /api/datasources`).
 - Grafana runs with anonymous Viewer + `admin/admin` for edit. Dev-only.
 - `deploy/observability/prometheus.yml` statically scrapes three

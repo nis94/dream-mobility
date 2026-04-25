@@ -12,8 +12,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/nis94/dream-mobility/internal/avro"
-	"github.com/nis94/dream-mobility/internal/tracing"
+	"github.com/nis94/dream-flight/internal/avro"
+	"github.com/nis94/dream-flight/internal/tracing"
 	"github.com/segmentio/kafka-go"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -24,18 +24,19 @@ import (
 
 // tracer is the package-level OTel tracer. Using a package-level var keeps
 // the API of Producer unchanged — callers don't have to pass a tracer.
-var tracer = otel.Tracer("github.com/nis94/dream-mobility/internal/producer")
+var tracer = otel.Tracer("github.com/nis94/dream-flight/internal/producer")
 
 // srHTTPClient bounds each Schema Registry request. The caller can further
 // bound total operation time via context.
 var srHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
-// Producer serializes MovementEvents to Avro with the Confluent Schema Registry
-// wire format (magic byte + 4-byte schema ID + Avro binary) and writes them to Kafka.
+// Producer serializes FlightTelemetry events to Avro with the Confluent Schema
+// Registry wire format (magic byte + 4-byte schema ID + Avro binary) and writes
+// them to Kafka.
 //
 // Durability note: we use RequiredAcks=RequireOne and MaxAttempts=3 without
 // the idempotent producer. This is at-least-once and can duplicate on broker
-// retry; consumers MUST dedupe on event_id at the raw_events sink.
+// retry; consumers MUST dedupe on event_id at the flight_telemetry sink.
 // For production, switch to RequireAll with replication-factor>=3 and
 // min.insync.replicas=2, and consider a client that supports
 // enable.idempotence=true (confluent-kafka-go / librdkafka).
@@ -46,9 +47,9 @@ type Producer struct {
 }
 
 // New creates a Producer. It registers the canonical schema (embedded from
-// schemas/movement_event.avsc) with Schema Registry and caches the returned
-// schema ID for the wire-format prefix. Registration retries with ctx-aware
-// backoff on transient failures.
+// internal/avro/flight_telemetry.avsc) with Schema Registry and caches the
+// returned schema ID for the wire-format prefix. Registration retries with
+// ctx-aware backoff on transient failures.
 func New(ctx context.Context, brokers []string, topic, schemaRegistryURL string, logger *slog.Logger) (*Producer, error) {
 	subject := topic + "-value"
 	schemaID, err := registerSchema(ctx, schemaRegistryURL, subject, avro.CanonicalSchema, logger)
@@ -77,13 +78,14 @@ func New(ctx context.Context, brokers []string, topic, schemaRegistryURL string,
 }
 
 // Produce serializes the event and writes it to Kafka.
-// Key = "entity_type:entity_id" (for per-entity partition affinity).
+// Key = icao24 (for per-aircraft partition affinity — same icao24 → same
+// partition → single consumer preserves trajectory ordering).
 //
 // A child span "kafka.produce" is started under the caller's context and its
 // W3C TraceContext is injected into the outgoing message headers so the
 // consumer can continue the same trace.
-func (p *Producer) Produce(ctx context.Context, event *avro.MovementEvent) error {
-	key := event.EntityType + ":" + event.EntityID
+func (p *Producer) Produce(ctx context.Context, event *avro.FlightTelemetry) error {
+	key := event.Icao24
 
 	// Span covers both Avro marshal and Kafka write so marshal failures show
 	// up in traces the same way write failures do.
@@ -94,8 +96,8 @@ func (p *Producer) Produce(ctx context.Context, event *avro.MovementEvent) error
 			semconv.MessagingDestinationName(p.writer.Topic),
 			semconv.MessagingKafkaMessageKey(key),
 			attribute.String("event.id", event.EventID),
-			attribute.String("entity.type", event.EntityType),
-			attribute.String("entity.id", event.EntityID),
+			attribute.String("aircraft.icao24", event.Icao24),
+			attribute.String("aircraft.origin_country", event.OriginCountry),
 		),
 	)
 	defer span.End()

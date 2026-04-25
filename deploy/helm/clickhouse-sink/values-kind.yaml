@@ -6,9 +6,9 @@ image:
 env:
   PROM_PORT: "9467"
   KAFKA_BROKERS: "host.docker.internal:39092"
-  KAFKA_TOPIC: "movement.events"
-  KAFKA_GROUP_ID: "mobility-clickhouse"
+  KAFKA_TOPIC: "flight.telemetry"
+  KAFKA_GROUP_ID: "flight-clickhouse"
   CLICKHOUSE_ADDR: "host.docker.internal:9000"
-  CLICKHOUSE_DB: "mobility"
+  CLICKHOUSE_DB: "flight"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"
   LOG_LEVEL: "DEBUG"
