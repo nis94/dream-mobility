@@ -63,7 +63,11 @@ services:
       # A producer hitting an unknown topic should fail loudly, not silently
       # create a 1-partition topic that breaks per-entity ordering.
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
-      KAFKA_LOG_RETENTION_HOURS: 168
+      # 48h trims steady-state Kafka log to ~600 MB across the 3 partitions
+      # of flight.telemetry (down from ~2 GB at 168h). Replay-from-Kafka
+      # window shortens to 2 days; sinks have already absorbed everything
+      # older into Postgres / ClickHouse / Iceberg.
+      KAFKA_LOG_RETENTION_HOURS: 48
       # Stable cluster id (base64-encoded UUID); pinning it keeps volumes reusable across restarts.
       CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qg'
     ports:
