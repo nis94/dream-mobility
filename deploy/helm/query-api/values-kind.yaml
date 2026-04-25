@@ -8,7 +8,7 @@ service:
   # kind's extraPortMappings (only ingest-api 8080 and ArgoCD 8443 are).
   # An allocated-but-unreachable NodePort is worse than a ClusterIP; when
   # you need to query from the host, use:
-  #   kubectl port-forward svc/dm-query-api-query-api 8090:8090
+  #   kubectl port-forward svc/df-query-api-query-api 8090:8090
   type: ClusterIP
   port: 8090
   targetPort: 8090
@@ -16,6 +16,6 @@ service:
 env:
   QUERY_HTTP_PORT: "8090"
   PROM_PORT: "9465"
-  POSTGRES_DSN: "postgres://postgres:postgres@host.docker.internal:5432/mobility?sslmode=disable"
+  POSTGRES_DSN: "postgres://postgres:postgres@host.docker.internal:5432/flight?sslmode=disable"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"
   LOG_LEVEL: "DEBUG"

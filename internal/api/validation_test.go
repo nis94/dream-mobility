@@ -5,14 +5,17 @@ import (
 	"time"
 )
 
-func ptr[T any](v T) *T { return &v }
+// ptr is shared with handler_test.go.
 
 func validEvent() EventRequest {
 	return EventRequest{
-		EventID:   "550e8400-e29b-41d4-a716-446655440000",
-		Entity:    EntityField{Type: "vehicle", ID: "vehicle-1"},
-		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
-		Position:  PositionField{Lat: 52.52, Lon: 13.405},
+		EventID:        "550e8400-e29b-41d4-a716-446655440000",
+		Icao24:         "abc123",
+		OriginCountry:  "GB",
+		ObservedAt:     time.Now().UTC().Format(time.RFC3339Nano),
+		PositionSource: "ADSB",
+		Lat:            52.52,
+		Lon:            13.405,
 	}
 }
 
@@ -29,10 +32,14 @@ func TestValidateEvent_Valid(t *testing.T) {
 
 func TestValidateEvent_ValidWithOptionals(t *testing.T) {
 	e := validEvent()
-	e.SpeedKmh = ptr(42.3)
-	e.HeadingDeg = ptr(137.5)
-	e.AccuracyM = ptr(4.2)
-	e.Source = ptr("gps")
+	e.Callsign = ptr("BAW123")
+	e.BaroAltitudeM = ptr(11000.0)
+	e.GeoAltitudeM = ptr(11050.0)
+	e.VelocityMs = ptr(245.5)
+	e.TrueTrackDeg = ptr(137.5)
+	e.VerticalRateMs = ptr(-2.5)
+	e.Squawk = ptr("1234")
+	e.Category = ptr(5)
 	if _, err := ValidateEvent(&e); err != nil {
 		t.Errorf("expected valid, got: %v", err)
 	}
@@ -40,7 +47,7 @@ func TestValidateEvent_ValidWithOptionals(t *testing.T) {
 
 func TestValidateEvent_ReturnedTimestampMatchesInput(t *testing.T) {
 	e := validEvent()
-	e.Timestamp = "2025-03-15T12:34:56.789Z"
+	e.ObservedAt = "2025-03-15T12:34:56.789Z"
 	ts, err := ValidateEvent(&e)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -58,9 +65,10 @@ func TestValidateEvent_MissingRequired(t *testing.T) {
 		want string
 	}{
 		{"missing event_id", func(e *EventRequest) { e.EventID = "" }, "event_id is required"},
-		{"missing entity.type", func(e *EventRequest) { e.Entity.Type = "" }, "entity.type is required"},
-		{"missing entity.id", func(e *EventRequest) { e.Entity.ID = "" }, "entity.id is required"},
-		{"missing timestamp", func(e *EventRequest) { e.Timestamp = "" }, "timestamp is required"},
+		{"missing icao24", func(e *EventRequest) { e.Icao24 = "" }, "icao24 is required"},
+		{"missing origin_country", func(e *EventRequest) { e.OriginCountry = "" }, "origin_country is required"},
+		{"missing observed_at", func(e *EventRequest) { e.ObservedAt = "" }, "observed_at is required"},
+		{"missing position_source", func(e *EventRequest) { e.PositionSource = "" }, "position_source is required"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -74,19 +82,43 @@ func TestValidateEvent_MissingRequired(t *testing.T) {
 	}
 }
 
+func TestValidateEvent_BadIcao24(t *testing.T) {
+	e := validEvent()
+	e.Icao24 = "ABC123" // uppercase rejected
+	if _, err := ValidateEvent(&e); err == nil {
+		t.Error("expected error for uppercase icao24")
+	}
+	e.Icao24 = "xyz" // not 6 chars
+	if _, err := ValidateEvent(&e); err == nil {
+		t.Error("expected error for short icao24")
+	}
+	e.Icao24 = "abc12g" // 'g' is not hex
+	if _, err := ValidateEvent(&e); err == nil {
+		t.Error("expected error for non-hex icao24")
+	}
+}
+
+func TestValidateEvent_BadPositionSource(t *testing.T) {
+	e := validEvent()
+	e.PositionSource = "GPS"
+	if _, err := ValidateEvent(&e); err == nil {
+		t.Error("expected error for unknown position_source")
+	}
+}
+
 func TestValidateEvent_BadTimestamp(t *testing.T) {
 	e := validEvent()
-	e.Timestamp = "not-a-date"
+	e.ObservedAt = "not-a-date"
 	if _, err := ValidateEvent(&e); err == nil {
-		t.Error("expected error for bad timestamp")
+		t.Error("expected error for bad observed_at")
 	}
 }
 
 func TestValidateEvent_FutureTimestamp(t *testing.T) {
 	e := validEvent()
-	e.Timestamp = time.Now().Add(25 * time.Hour).UTC().Format(time.RFC3339Nano)
+	e.ObservedAt = time.Now().Add(25 * time.Hour).UTC().Format(time.RFC3339Nano)
 	if _, err := ValidateEvent(&e); err == nil {
-		t.Error("expected error for future timestamp")
+		t.Error("expected error for future observed_at")
 	}
 }
 
@@ -101,7 +133,7 @@ func TestValidateEvent_LatOutOfRange(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			e := validEvent()
-			e.Position.Lat = tt.lat
+			e.Lat = tt.lat
 			if _, err := ValidateEvent(&e); err == nil {
 				t.Error("expected error for lat out of range")
 			}
@@ -111,32 +143,44 @@ func TestValidateEvent_LatOutOfRange(t *testing.T) {
 
 func TestValidateEvent_LonOutOfRange(t *testing.T) {
 	e := validEvent()
-	e.Position.Lon = 181.0
+	e.Lon = 181.0
 	if _, err := ValidateEvent(&e); err == nil {
 		t.Error("expected error for lon out of range")
 	}
 }
 
-func TestValidateEvent_NegativeSpeed(t *testing.T) {
+func TestValidateEvent_NegativeVelocity(t *testing.T) {
 	e := validEvent()
-	e.SpeedKmh = ptr(-1.0)
+	e.VelocityMs = ptr(-1.0)
 	if _, err := ValidateEvent(&e); err == nil {
-		t.Error("expected error for negative speed")
+		t.Error("expected error for negative velocity")
 	}
 }
 
-func TestValidateEvent_HeadingOutOfRange(t *testing.T) {
+func TestValidateEvent_TrackOutOfRange(t *testing.T) {
 	e := validEvent()
-	e.HeadingDeg = ptr(360.0)
+	e.TrueTrackDeg = ptr(360.0)
 	if _, err := ValidateEvent(&e); err == nil {
-		t.Error("expected error for heading >= 360")
+		t.Error("expected error for true_track_deg >= 360")
 	}
 }
 
-func TestValidateEvent_NegativeAccuracy(t *testing.T) {
+func TestValidateEvent_BadSquawk(t *testing.T) {
 	e := validEvent()
-	e.AccuracyM = ptr(-0.5)
+	e.Squawk = ptr("9999") // 9 is not octal
 	if _, err := ValidateEvent(&e); err == nil {
-		t.Error("expected error for negative accuracy")
+		t.Error("expected error for non-octal squawk")
+	}
+	e.Squawk = ptr("123") // 3 chars
+	if _, err := ValidateEvent(&e); err == nil {
+		t.Error("expected error for short squawk")
+	}
+}
+
+func TestValidateEvent_CategoryOutOfRange(t *testing.T) {
+	e := validEvent()
+	e.Category = ptr(21)
+	if _, err := ValidateEvent(&e); err == nil {
+		t.Error("expected error for category > 20")
 	}
 }

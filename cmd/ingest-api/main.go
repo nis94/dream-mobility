@@ -14,10 +14,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/nis94/dream-mobility/internal/api"
-	"github.com/nis94/dream-mobility/internal/config"
-	otelinit "github.com/nis94/dream-mobility/internal/otel"
-	"github.com/nis94/dream-mobility/internal/producer"
+	"github.com/nis94/dream-flight/internal/api"
+	"github.com/nis94/dream-flight/internal/config"
+	otelinit "github.com/nis94/dream-flight/internal/otel"
+	"github.com/nis94/dream-flight/internal/producer"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 

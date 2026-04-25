@@ -7,9 +7,10 @@ deploy/observability
 loadtest
 tools/generator
 services
-# Un-ignore the archiver — it has its own Dockerfile at services/archiver/
-# and needs the source + pyproject + lock inside the build context.
+# Un-ignore Python services that have their own Dockerfiles and need their
+# source + pyproject + lock inside the build context.
 !services/archiver
+!services/opensky-ingest
 migrations
 scripts
 **/*_test.go

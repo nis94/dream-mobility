@@ -20,8 +20,8 @@ func TestLoad_Defaults(t *testing.T) {
 	if !reflect.DeepEqual(cfg.KafkaBrokers, []string{"localhost:29092"}) {
 		t.Errorf("KafkaBrokers = %v, want [localhost:29092]", cfg.KafkaBrokers)
 	}
-	if cfg.KafkaTopic != "movement.events" {
-		t.Errorf("KafkaTopic = %q, want movement.events", cfg.KafkaTopic)
+	if cfg.KafkaTopic != "flight.telemetry" {
+		t.Errorf("KafkaTopic = %q, want flight.telemetry", cfg.KafkaTopic)
 	}
 	if cfg.SchemaRegistryURL != "http://localhost:8081" {
 		t.Errorf("SchemaRegistryURL = %q", cfg.SchemaRegistryURL)

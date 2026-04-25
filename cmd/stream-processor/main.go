@@ -9,10 +9,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nis94/dream-mobility/internal/config"
-	"github.com/nis94/dream-mobility/internal/kafkametrics"
-	otelinit "github.com/nis94/dream-mobility/internal/otel"
-	"github.com/nis94/dream-mobility/internal/processor"
+	"github.com/nis94/dream-flight/internal/config"
+	"github.com/nis94/dream-flight/internal/kafkametrics"
+	otelinit "github.com/nis94/dream-flight/internal/otel"
+	"github.com/nis94/dream-flight/internal/processor"
 )
 
 const (

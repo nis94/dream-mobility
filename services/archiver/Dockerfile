@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 FROM python:3.13-slim
 
 # procps gives us pgrep for the liveness probe; curl is kept off to keep the
-# image small. Run as non-root uid 65532 to match the other dream-mobility
+# image small. Run as non-root uid 65532 to match the other dream-flight
 # charts' securityContext.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends procps \
@@ -41,7 +41,7 @@ COPY --from=build /app/services/archiver/.venv /app/services/archiver/.venv
 COPY services/archiver/archiver.py ./archiver.py
 # Mirrors the host-side repo layout so archiver.py's relative schema path
 # (`../../internal/avro/movement_event.avsc`) resolves unchanged.
-COPY internal/avro/movement_event.avsc /app/internal/avro/movement_event.avsc
+COPY internal/avro/flight_telemetry.avsc /app/internal/avro/flight_telemetry.avsc
 
 ENV PATH="/app/services/archiver/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \

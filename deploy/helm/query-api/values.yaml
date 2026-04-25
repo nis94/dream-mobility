@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: dream-mobility/query-api
+  repository: dream-flight/query-api
   tag: ""          # defaults to Chart.AppVersion
   pullPolicy: IfNotPresent
 
@@ -20,14 +20,14 @@ env:
   # deployment, DO NOT ship credentials in values.yaml. Instead, set
   # `postgresSecret.name` below (and leave this POSTGRES_DSN blank) so the
   # deployment pulls the DSN from a Kubernetes Secret via valueFrom.
-  POSTGRES_DSN: "postgres://postgres:postgres@postgres:5432/mobility?sslmode=disable"
+  POSTGRES_DSN: "postgres://postgres:postgres@postgres:5432/flight?sslmode=disable"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
   LOG_LEVEL: "INFO"
 
 # Production override — uncomment to pull the DSN from a Secret.
 # When set, the template ignores the inline POSTGRES_DSN above.
 # postgresSecret:
-#   name: dm-postgres-dsn
+#   name: df-postgres-dsn
 #   key: dsn
 
 resources:

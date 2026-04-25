@@ -11,14 +11,14 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: dm-root
+  name: df-root
   namespace: argocd
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
   project: default
   source:
-    repoURL: https://github.com/nis94/dream-mobility.git
+    repoURL: https://github.com/nis94/dream-flight.git
     targetRevision: main
     path: deploy/argocd/apps
     directory:

@@ -1,4 +1,4 @@
-# Local development stack for the Dream Mobility project.
+# Local development stack for the Dream Flight project.
 # All services run on a single bridge network. `make up` waits for healthy
 # state; `make down-v` wipes volumes.
 #
@@ -18,7 +18,7 @@
 #   8181  -> 8181   Apache Iceberg REST catalog
 #   8088  -> 8080   Kafka UI
 
-name: dream-mobility
+name: dream-flight
 
 x-healthcheck-defaults: &hc-defaults
   interval: 5s
@@ -34,7 +34,7 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.6.1
     hostname: kafka
-    container_name: dm-kafka
+    container_name: df-kafka
     environment:
       # KRaft: this single node plays both roles
       KAFKA_NODE_ID: 1
@@ -80,9 +80,9 @@ services:
       test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
 
   # ---------------------------------------------------------------------------
-  # Kafka bootstrap -- creates the `movement.events` topic, then exits.
+  # Kafka bootstrap -- creates the `flight.telemetry` topic, then exits.
   # The authoritative topic owner now that KAFKA_AUTO_CREATE_TOPICS_ENABLE is
-  # disabled. Partitions = 3: producer keys by entity_type:entity_id with the
+  # disabled. Partitions = 3: producer keys by icao24 with the
   # Murmur2 balancer, so 3 partitions give per-entity ordering plus
   # parallelism for local dev.
   #
@@ -94,7 +94,7 @@ services:
   # ---------------------------------------------------------------------------
   kafka-init:
     image: confluentinc/cp-kafka:7.6.1
-    container_name: dm-kafka-init
+    container_name: df-kafka-init
     depends_on:
       kafka:
         condition: service_healthy
@@ -103,7 +103,7 @@ services:
       set -e
       kafka-topics --bootstrap-server kafka:9092 \
         --create --if-not-exists \
-        --topic movement.events \
+        --topic flight.telemetry \
         --partitions 3 \
         --replication-factor 1
       echo "Kafka bootstrap done."
@@ -116,7 +116,7 @@ services:
   schema-registry:
     image: confluentinc/cp-schema-registry:7.6.1
     hostname: schema-registry
-    container_name: dm-schema-registry
+    container_name: df-schema-registry
     depends_on:
       kafka:
         condition: service_healthy
@@ -139,7 +139,7 @@ services:
     # Digest-pinned for reproducibility. Replace with a semver tag once the
     # project publishes one we want to track (e.g. provectuslabs/kafka-ui:v1.x).
     image: provectuslabs/kafka-ui@sha256:8f2ff02d64b0a7a2b71b6b3b3148b85f66d00ec20ad40c30bdcd415d46d31818
-    container_name: dm-kafka-ui
+    container_name: df-kafka-ui
     depends_on:
       kafka:
         condition: service_healthy
@@ -150,7 +150,7 @@ services:
       kafka-init:
         condition: service_completed_successfully
     environment:
-      KAFKA_CLUSTERS_0_NAME: dream-mobility
+      KAFKA_CLUSTERS_0_NAME: dream-flight
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
       KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
       DYNAMIC_CONFIG_ENABLED: 'true'
@@ -161,17 +161,17 @@ services:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/ || exit 1"]
 
   # ---------------------------------------------------------------------------
-  # Postgres -- hot state (raw_events dedupe, entity_positions last-known-pos)
+  # Postgres -- hot state (flight_telemetry dedupe, aircraft_state last-known-pos)
   # ---------------------------------------------------------------------------
   postgres:
     image: postgres:16-alpine
     hostname: postgres
-    container_name: dm-postgres
+    container_name: df-postgres
     environment:
       # DEV-ONLY credentials.
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: mobility
+      POSTGRES_DB: flight
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -179,7 +179,7 @@ services:
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       <<: *hc-defaults
-      test: ["CMD-SHELL", "pg_isready -U postgres -d mobility"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d flight"]
 
   # ---------------------------------------------------------------------------
   # ClickHouse -- analytical store (raw_events + materialized rollups)
@@ -187,9 +187,9 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.3
     hostname: clickhouse
-    container_name: dm-clickhouse
+    container_name: df-clickhouse
     environment:
-      CLICKHOUSE_DB: mobility
+      CLICKHOUSE_DB: flight
       CLICKHOUSE_USER: default
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
       CLICKHOUSE_PASSWORD: ""
@@ -213,7 +213,7 @@ services:
   minio:
     image: minio/minio:RELEASE.2024-09-13T20-26-02Z
     hostname: minio
-    container_name: dm-minio
+    container_name: df-minio
     command: server /data --console-address ":9001"
     environment:
       # DEV-ONLY credentials.
@@ -233,7 +233,7 @@ services:
   # ---------------------------------------------------------------------------
   minio-init:
     image: minio/mc:RELEASE.2024-09-16T17-43-14Z
-    container_name: dm-minio-init
+    container_name: df-minio-init
     depends_on:
       minio:
         condition: service_healthy
@@ -261,7 +261,7 @@ services:
   iceberg-rest:
     image: tabulario/iceberg-rest:1.6.0
     hostname: iceberg-rest
-    container_name: dm-iceberg-rest
+    container_name: df-iceberg-rest
     depends_on:
       minio-init:
         condition: service_completed_successfully

@@ -8,7 +8,7 @@
 # DEV-ONLY stack. No credentials are protected. Do not expose these ports
 # on any shared network without a reverse proxy + auth in front.
 
-name: dream-mobility
+name: dream-flight
 
 x-healthcheck-defaults: &hc-defaults
   interval: 10s
@@ -19,7 +19,7 @@ x-healthcheck-defaults: &hc-defaults
 services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.104.0
-    container_name: dm-otel-collector
+    container_name: df-otel-collector
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
     volumes:
       - ./observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
@@ -37,7 +37,7 @@ services:
 
   jaeger:
     image: jaegertracing/all-in-one:1.58
-    container_name: dm-jaeger
+    container_name: df-jaeger
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
@@ -49,7 +49,7 @@ services:
 
   prometheus:
     image: prom/prometheus:v2.53.0
-    container_name: dm-prometheus
+    container_name: df-prometheus
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
@@ -62,7 +62,7 @@ services:
 
   grafana:
     image: grafana/grafana:11.1.0
-    container_name: dm-grafana
+    container_name: df-grafana
     environment:
       # DEV-ONLY anonymous access with Viewer role. Do NOT promote Admin
       # — earlier revisions did and that grants dashboard / data-source

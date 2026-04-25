@@ -30,10 +30,31 @@ datasources:
     uid: jaeger
     type: jaeger
     access: proxy
-    url: http://dm-jaeger:16686
+    url: http://df-jaeger:16686
     editable: false
     jsonData:
       # Clicking a span in the trace view offers a "View logs / metrics"
       # drill-down via the Prometheus datasource above.
       tracesToMetrics:
         datasourceUid: prometheus
+
+  # Postgres feeds the aviation Live Flights dashboard. The data is in
+  # flight_telemetry (raw) and aircraft_state (latest per icao24).
+  # ClickHouse rollups exist with richer rollups (country / airline / grid)
+  # but Grafana 11 doesn't bundle a ClickHouse plugin, so we expose Postgres
+  # for the dashboard layer; ClickHouse remains the analytical store and
+  # can be queried directly via clickhouse-client / Kafka UI.
+  - name: Postgres
+    uid: postgres
+    type: postgres
+    access: proxy
+    url: host.docker.internal:5432
+    user: postgres
+    secureJsonData:
+      password: postgres
+    jsonData:
+      database: flight
+      sslmode: disable
+      postgresVersion: 1600  # PG 16.x
+      timescaledb: false
+    editable: false

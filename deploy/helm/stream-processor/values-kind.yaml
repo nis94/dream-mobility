@@ -14,8 +14,8 @@ image:
 env:
   PROM_PORT: "9466"
   KAFKA_BROKERS: "host.docker.internal:39092"
-  KAFKA_TOPIC: "movement.events"
-  KAFKA_GROUP_ID: "mobility-postgres"
-  POSTGRES_DSN: "postgres://postgres:postgres@host.docker.internal:5432/mobility?sslmode=disable"
+  KAFKA_TOPIC: "flight.telemetry"
+  KAFKA_GROUP_ID: "flight-postgres"
+  POSTGRES_DSN: "postgres://postgres:postgres@host.docker.internal:5432/flight?sslmode=disable"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"
   LOG_LEVEL: "DEBUG"

@@ -10,13 +10,13 @@
 apiVersion: 1
 
 providers:
-  - name: dream-mobility
+  - name: dream-flight
     orgId: 1
-    folder: 'Dream Mobility'
+    folder: 'Dream Flight'
     type: file
     disableDeletion: false
     updateIntervalSeconds: 10
     allowUiUpdates: true
     options:
-      path: /etc/grafana/provisioning/dashboards/dream-mobility
+      path: /etc/grafana/provisioning/dashboards/dream-flight
       foldersFromFilesStructure: false

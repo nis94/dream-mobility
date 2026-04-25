@@ -1,4 +1,4 @@
-// Package chsink batches MovementEvent records and writes them to
+// Package chsink batches FlightTelemetry records and writes them to
 // ClickHouse via the native protocol.
 //
 // Correctness contract (Phase 5 audit fix): the Sink is a pure buffer + batch
@@ -20,7 +20,7 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
-	avroschema "github.com/nis94/dream-mobility/internal/avro"
+	avroschema "github.com/nis94/dream-flight/internal/avro"
 )
 
 //go:embed schema.sql
@@ -53,7 +53,7 @@ type Sink struct {
 	batchSize int
 
 	mu  sync.Mutex
-	buf []*avroschema.MovementEvent
+	buf []*avroschema.FlightTelemetry
 }
 
 // New connects to ClickHouse, applies the embedded migration, and returns
@@ -107,7 +107,7 @@ func New(ctx context.Context, cfg Config, logger *slog.Logger) (*Sink, error) {
 		conn:      conn,
 		logger:    logger,
 		batchSize: cfg.BatchSize,
-		buf:       make([]*avroschema.MovementEvent, 0, cfg.BatchSize),
+		buf:       make([]*avroschema.FlightTelemetry, 0, cfg.BatchSize),
 	}, nil
 }
 
@@ -115,7 +115,7 @@ func New(ctx context.Context, cfg Config, logger *slog.Logger) (*Sink, error) {
 // Add never triggers a flush on its own — the caller decides when to Flush
 // (after hitting batchSize, on a timer, or on shutdown). This keeps flushing
 // serialized with Kafka offset commits.
-func (s *Sink) Add(_ context.Context, event *avroschema.MovementEvent) {
+func (s *Sink) Add(_ context.Context, event *avroschema.FlightTelemetry) {
 	s.mu.Lock()
 	s.buf = append(s.buf, event)
 	s.mu.Unlock()
@@ -145,7 +145,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 	// race a concurrent Add() on the same backing array. Today the public API
 	// is single-goroutine by contract, but the mutex advertises thread-safety
 	// and the detached copy costs only one allocation per flush.
-	batch := make([]*avroschema.MovementEvent, n)
+	batch := make([]*avroschema.FlightTelemetry, n)
 	copy(batch, s.buf)
 	s.mu.Unlock()
 
@@ -161,11 +161,11 @@ func (s *Sink) Flush(ctx context.Context) error {
 	// arrived while writeBatch was in flight are retained.
 	if len(s.buf) > n {
 		remaining := len(s.buf) - n
-		tail := make([]*avroschema.MovementEvent, remaining, s.batchSize)
+		tail := make([]*avroschema.FlightTelemetry, remaining, s.batchSize)
 		copy(tail, s.buf[n:])
 		s.buf = tail
 	} else {
-		s.buf = make([]*avroschema.MovementEvent, 0, s.batchSize)
+		s.buf = make([]*avroschema.FlightTelemetry, 0, s.batchSize)
 	}
 	s.mu.Unlock()
 
@@ -182,26 +182,24 @@ func (s *Sink) Close(ctx context.Context) error {
 	return s.conn.Close()
 }
 
-func (s *Sink) writeBatch(ctx context.Context, events []*avroschema.MovementEvent) error {
+func (s *Sink) writeBatch(ctx context.Context, events []*avroschema.FlightTelemetry) error {
 	batch, err := s.conn.PrepareBatch(ctx, `
-		INSERT INTO raw_events (
-			event_id, entity_type, entity_id, event_ts,
-			lat, lon, speed_kmh, heading_deg, accuracy_m,
-			source, attributes
+		INSERT INTO flight.telemetry (
+			event_id, icao24, callsign, origin_country, observed_at, position_source,
+			lat, lon, baro_altitude_m, geo_altitude_m, velocity_ms, true_track_deg,
+			vertical_rate_ms, on_ground, squawk, spi, category
 		)`)
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
 
 	for _, ev := range events {
-		attrs := ""
-		if ev.Attributes != nil {
-			attrs = *ev.Attributes
-		}
+		// ClickHouse-go maps Go bool → UInt8 for the on_ground / spi columns
+		// in the new schema, so passing the bool directly is correct.
 		if err := batch.Append(
-			ev.EventID, ev.EntityType, ev.EntityID, ev.Timestamp,
-			ev.Lat, ev.Lon, ev.SpeedKmh, ev.HeadingDeg, ev.AccuracyM,
-			ev.Source, attrs,
+			ev.EventID, ev.Icao24, ev.Callsign, ev.OriginCountry, ev.ObservedAt, ev.PositionSource,
+			ev.Lat, ev.Lon, ev.BaroAltitudeM, ev.GeoAltitudeM, ev.VelocityMs, ev.TrueTrackDeg,
+			ev.VerticalRateMs, ev.OnGround, ev.Squawk, ev.Spi, ev.Category,
 		); err != nil {
 			return fmt.Errorf("append to batch: %w", err)
 		}

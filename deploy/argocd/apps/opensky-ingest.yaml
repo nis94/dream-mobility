@@ -1,7 +1,7 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: df-query-api
+  name: df-opensky-ingest
   namespace: argocd
   finalizers:
     - resources-finalizer.argocd.argoproj.io
@@ -10,9 +10,9 @@ spec:
   source:
     repoURL: https://github.com/nis94/dream-flight.git
     targetRevision: main
-    path: deploy/helm/query-api
+    path: deploy/helm/opensky-ingest
     helm:
-      releaseName: df-query-api
+      releaseName: df-opensky-ingest
       valueFiles:
         - values.yaml
         - values-kind.yaml

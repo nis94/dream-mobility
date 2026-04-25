@@ -1,0 +1,40 @@
+# replicaCount is hardcoded to 1 in the template — multiple replicas would
+# duplicate every poll (each pod fetches /states/all independently and produces
+# its own messages). HA would need leader election; out of scope today.
+replicaCount: 1
+
+image:
+  repository: dream-flight/opensky-ingest
+  tag: ""          # defaults to Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+env:
+  KAFKA_BROKERS: "kafka:9092"
+  KAFKA_TOPIC: "flight.telemetry"
+  SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+  OPENSKY_URL: "https://opensky-network.org/api/states/all"
+  # Anonymous OpenSky access = 400 credits/day = 1 credit per /states/all
+  # call. 300s = 288 polls/day, comfortably under the limit. Drop below 215s
+  # only with OAuth2 client credentials (4000/day).
+  POLL_INTERVAL_SECONDS: "300"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+  LOG_LEVEL: "INFO"
+
+# Optional OAuth2 client credentials for higher-rate authenticated polling.
+# Uncomment and provide a Secret with both keys; values.env keys above are
+# ignored when the secret reference is present.
+# openskySecret:
+#   name: df-opensky-credentials
+#   clientIdKey: clientId
+#   clientSecretKey: clientSecret
+
+resources:
+  requests:
+    memory: "128Mi"
+    cpu: "100m"
+  limits:
+    # OpenSky responses for the global /states/all are ~5-10MB JSON; with
+    # ~10k aircraft per poll, the in-flight Avro encode + Kafka producer
+    # queue stays comfortably under 256Mi.
+    memory: "256Mi"
+    cpu: "500m"

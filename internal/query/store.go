@@ -2,7 +2,6 @@ package query
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -11,8 +10,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// ErrNotFound is returned when the requested entity has no data.
-var ErrNotFound = errors.New("entity not found")
+// ErrNotFound is returned when the requested aircraft has no data.
+var ErrNotFound = errors.New("aircraft not found")
 
 // Pool defaults tuned for a read-only query workload. Heavier on MaxConns
 // than the writer pool because request concurrency dominates, lighter on
@@ -42,6 +41,12 @@ const (
 	defaultLimit = 100
 	maxLimit     = 1000
 )
+
+// activeWindow bounds the "active aircraft" lookup. Anything older than this
+// is considered stale (signal lost / aircraft on the ground at a small
+// airport with no reporter coverage). 5 minutes is comfortably wider than
+// OpenSky's 300s anonymous polling interval.
+const activeWindow = 5 * time.Minute
 
 // Store provides read-only Postgres queries for the Query API.
 type Store struct {
@@ -86,78 +91,61 @@ func (s *Store) Close() {
 	s.pool.Close()
 }
 
-// Position is the last-known location for a single entity.
-type Position struct {
-	EntityType  string    `json:"entity_type"`
-	EntityID    string    `json:"entity_id"`
-	EventTS     time.Time `json:"event_ts"`
-	Lat         float64   `json:"lat"`
-	Lon         float64   `json:"lon"`
-	LastEventID string    `json:"last_event_id"`
-	UpdatedAt   time.Time `json:"updated_at"`
+// AircraftState is the last-known state for a single aircraft (one row of
+// aircraft_state). Embedded in the aviation query endpoints.
+type AircraftState struct {
+	Icao24        string    `json:"icao24"`
+	LastCallsign  *string   `json:"last_callsign,omitempty"`
+	OriginCountry string    `json:"origin_country"`
+	ObservedAt    time.Time `json:"observed_at"`
+	Lat           float64   `json:"lat"`
+	Lon           float64   `json:"lon"`
+	BaroAltitudeM *float64  `json:"baro_altitude_m,omitempty"`
+	VelocityMs    *float64  `json:"velocity_ms,omitempty"`
+	OnGround      bool      `json:"on_ground"`
+	LastSquawk    *string   `json:"last_squawk,omitempty"`
+	LastEventID   string    `json:"last_event_id"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-// GetPosition returns the last-known position for the given entity. The
-// request context is further bounded by pointReadTimeout to protect against
-// pathological plans.
-func (s *Store) GetPosition(ctx context.Context, entityType, entityID string) (*Position, error) {
+// GetAircraft returns the last-known state for the given icao24.
+func (s *Store) GetAircraft(ctx context.Context, icao24 string) (*AircraftState, error) {
 	ctx, cancel := context.WithTimeout(ctx, pointReadTimeout)
 	defer cancel()
 
-	var p Position
+	var a AircraftState
 	err := s.pool.QueryRow(ctx, `
-		SELECT entity_type, entity_id, event_ts, lat, lon, last_event_id, updated_at
-		FROM entity_positions
-		WHERE entity_type = $1 AND entity_id = $2`,
-		entityType, entityID,
-	).Scan(&p.EntityType, &p.EntityID, &p.EventTS, &p.Lat, &p.Lon, &p.LastEventID, &p.UpdatedAt)
+		SELECT icao24, last_callsign, origin_country, observed_at,
+		       lat, lon, baro_altitude_m, velocity_ms, on_ground,
+		       last_squawk, last_event_id, updated_at
+		FROM aircraft_state
+		WHERE icao24 = $1`,
+		icao24,
+	).Scan(
+		&a.Icao24, &a.LastCallsign, &a.OriginCountry, &a.ObservedAt,
+		&a.Lat, &a.Lon, &a.BaroAltitudeM, &a.VelocityMs, &a.OnGround,
+		&a.LastSquawk, &a.LastEventID, &a.UpdatedAt,
+	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("query entity_positions: %w", err)
+		return nil, fmt.Errorf("query aircraft_state: %w", err)
 	}
-	return &p, nil
+	return &a, nil
 }
 
-// RawEvent is a single row from raw_events. Attributes is opaque JSON bytes —
-// typed as json.RawMessage so the HTTP encoder passes it through as a nested
-// JSON object rather than double-encoding it as a string.
-type RawEvent struct {
-	EventID    string          `json:"event_id"`
-	EntityType string          `json:"entity_type"`
-	EntityID   string          `json:"entity_id"`
-	EventTS    time.Time       `json:"event_ts"`
-	Lat        float64         `json:"lat"`
-	Lon        float64         `json:"lon"`
-	SpeedKmh   *float64        `json:"speed_kmh,omitempty"`
-	HeadingDeg *float64        `json:"heading_deg,omitempty"`
-	AccuracyM  *float64        `json:"accuracy_m,omitempty"`
-	Source     *string         `json:"source,omitempty"`
-	Attributes json.RawMessage `json:"attributes,omitempty"`
-	IngestedAt time.Time       `json:"ingested_at"`
+// ActiveAircraftPage is a paginated list of currently active aircraft.
+type ActiveAircraftPage struct {
+	Aircraft   []AircraftState `json:"aircraft"`
+	NextCursor string          `json:"next_cursor,omitempty"`
 }
 
-// EventsPage is a paginated list of raw events. NextCursor is the opaque
-// token to pass as the ?cursor= query param to fetch the next page, or
-// empty if this is the last page.
-type EventsPage struct {
-	Events     []RawEvent `json:"events"`
-	NextCursor string     `json:"next_cursor,omitempty"`
-}
-
-// ListEvents returns raw events for the entity, ordered by (event_ts DESC,
-// event_id DESC). The composite ordering — and the composite cursor — is
-// load-bearing: event_ts alone is not unique, so a strict `event_ts < cursor`
-// predicate would silently drop any sibling rows sharing the boundary
-// microsecond. Row-wise comparison `(event_ts, event_id) < (ts, eid)` with
-// the matching ORDER BY serves every row exactly once.
-//
-// An empty result is returned as an empty slice (not an error) — we cannot
-// cheaply distinguish "unknown entity" from "known entity with zero events"
-// in a single query, so both collapse to "200 OK, empty list" at the HTTP
-// boundary.
-func (s *Store) ListEvents(ctx context.Context, entityType, entityID string, cursor Cursor, limit int) (*EventsPage, error) {
+// ListActive returns aircraft whose latest observation is within activeWindow.
+// Optional originCountry filter narrows the scan to a 2-letter country code
+// (matching the format OpenSky returns — typically a name like "United Kingdom",
+// not an ISO code; the producer normalizes whichever it gets).
+func (s *Store) ListActive(ctx context.Context, originCountry string, cursor Cursor, limit int) (*ActiveAircraftPage, error) {
 	switch {
 	case limit <= 0:
 		limit = defaultLimit
@@ -168,59 +156,190 @@ func (s *Store) ListEvents(ctx context.Context, entityType, entityID string, cur
 	ctx, cancel := context.WithTimeout(ctx, listQueryTimeout)
 	defer cancel()
 
-	// Fetch one extra row to detect whether a next page exists.
+	cutoff := time.Now().UTC().Add(-activeWindow)
+	fetchLimit := limit + 1
+
+	var rows pgx.Rows
+	var err error
+	switch {
+	case originCountry != "" && cursor.IsZero():
+		rows, err = s.pool.Query(ctx, `
+			SELECT icao24, last_callsign, origin_country, observed_at,
+			       lat, lon, baro_altitude_m, velocity_ms, on_ground,
+			       last_squawk, last_event_id, updated_at
+			FROM aircraft_state
+			WHERE origin_country = $1 AND observed_at >= $2
+			ORDER BY observed_at DESC, icao24 DESC
+			LIMIT $3`,
+			originCountry, cutoff, fetchLimit,
+		)
+	case originCountry != "":
+		rows, err = s.pool.Query(ctx, `
+			SELECT icao24, last_callsign, origin_country, observed_at,
+			       lat, lon, baro_altitude_m, velocity_ms, on_ground,
+			       last_squawk, last_event_id, updated_at
+			FROM aircraft_state
+			WHERE origin_country = $1 AND observed_at >= $2
+			  AND (observed_at, icao24) < ($3, $4)
+			ORDER BY observed_at DESC, icao24 DESC
+			LIMIT $5`,
+			originCountry, cutoff, cursor.EventTS, cursor.EventID, fetchLimit,
+		)
+	case cursor.IsZero():
+		rows, err = s.pool.Query(ctx, `
+			SELECT icao24, last_callsign, origin_country, observed_at,
+			       lat, lon, baro_altitude_m, velocity_ms, on_ground,
+			       last_squawk, last_event_id, updated_at
+			FROM aircraft_state
+			WHERE observed_at >= $1
+			ORDER BY observed_at DESC, icao24 DESC
+			LIMIT $2`,
+			cutoff, fetchLimit,
+		)
+	default:
+		rows, err = s.pool.Query(ctx, `
+			SELECT icao24, last_callsign, origin_country, observed_at,
+			       lat, lon, baro_altitude_m, velocity_ms, on_ground,
+			       last_squawk, last_event_id, updated_at
+			FROM aircraft_state
+			WHERE observed_at >= $1
+			  AND (observed_at, icao24) < ($2, $3)
+			ORDER BY observed_at DESC, icao24 DESC
+			LIMIT $4`,
+			cutoff, cursor.EventTS, cursor.EventID, fetchLimit,
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query aircraft_state list: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]AircraftState, 0, fetchLimit)
+	for rows.Next() {
+		var a AircraftState
+		if err := rows.Scan(
+			&a.Icao24, &a.LastCallsign, &a.OriginCountry, &a.ObservedAt,
+			&a.Lat, &a.Lon, &a.BaroAltitudeM, &a.VelocityMs, &a.OnGround,
+			&a.LastSquawk, &a.LastEventID, &a.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan aircraft_state: %w", err)
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+
+	page := &ActiveAircraftPage{Aircraft: out}
+	if len(out) > limit {
+		page.Aircraft = out[:limit]
+		last := out[limit-1]
+		page.NextCursor = Cursor{EventTS: last.ObservedAt, EventID: last.Icao24}.Encode()
+	}
+	return page, nil
+}
+
+// Telemetry is a single observation row from flight_telemetry — the full
+// per-emission state vector. Used by the per-aircraft trajectory endpoint.
+type Telemetry struct {
+	EventID        string    `json:"event_id"`
+	Icao24         string    `json:"icao24"`
+	Callsign       *string   `json:"callsign,omitempty"`
+	OriginCountry  string    `json:"origin_country"`
+	ObservedAt     time.Time `json:"observed_at"`
+	PositionSource string    `json:"position_source"`
+	Lat            float64   `json:"lat"`
+	Lon            float64   `json:"lon"`
+	BaroAltitudeM  *float64  `json:"baro_altitude_m,omitempty"`
+	GeoAltitudeM   *float64  `json:"geo_altitude_m,omitempty"`
+	VelocityMs     *float64  `json:"velocity_ms,omitempty"`
+	TrueTrackDeg   *float64  `json:"true_track_deg,omitempty"`
+	VerticalRateMs *float64  `json:"vertical_rate_ms,omitempty"`
+	OnGround       bool      `json:"on_ground"`
+	Squawk         *string   `json:"squawk,omitempty"`
+	Spi            bool      `json:"spi"`
+	Category       *int16    `json:"category,omitempty"`
+	IngestedAt     time.Time `json:"ingested_at"`
+}
+
+// TrackPage is a paginated trajectory for a single aircraft.
+type TrackPage struct {
+	Telemetry  []Telemetry `json:"telemetry"`
+	NextCursor string      `json:"next_cursor,omitempty"`
+}
+
+// GetTrack returns the per-observation trajectory for the given icao24.
+// Cursor is composite (observed_at, event_id) so duplicate timestamps within
+// the same icao24 are served exactly once.
+//
+// An empty result is "200 OK, empty list" — distinguishing "unknown aircraft"
+// from "known aircraft with no observations in this window" would need a
+// second query, and the HTTP boundary doesn't make that distinction useful.
+func (s *Store) GetTrack(ctx context.Context, icao24 string, cursor Cursor, limit int) (*TrackPage, error) {
+	switch {
+	case limit <= 0:
+		limit = defaultLimit
+	case limit > maxLimit:
+		limit = maxLimit
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, listQueryTimeout)
+	defer cancel()
+
 	fetchLimit := limit + 1
 
 	var rows pgx.Rows
 	var err error
 	if cursor.IsZero() {
 		rows, err = s.pool.Query(ctx, `
-			SELECT event_id, entity_type, entity_id, event_ts, lat, lon,
-			       speed_kmh, heading_deg, accuracy_m, source, attributes, ingested_at
-			FROM raw_events
-			WHERE entity_type = $1 AND entity_id = $2
-			ORDER BY event_ts DESC, event_id DESC
-			LIMIT $3`,
-			entityType, entityID, fetchLimit,
+			SELECT event_id, icao24, callsign, origin_country, observed_at, position_source,
+			       lat, lon, baro_altitude_m, geo_altitude_m, velocity_ms, true_track_deg,
+			       vertical_rate_ms, on_ground, squawk, spi, category, ingested_at
+			FROM flight_telemetry
+			WHERE icao24 = $1
+			ORDER BY observed_at DESC, event_id DESC
+			LIMIT $2`,
+			icao24, fetchLimit,
 		)
 	} else {
 		rows, err = s.pool.Query(ctx, `
-			SELECT event_id, entity_type, entity_id, event_ts, lat, lon,
-			       speed_kmh, heading_deg, accuracy_m, source, attributes, ingested_at
-			FROM raw_events
-			WHERE entity_type = $1 AND entity_id = $2
-			  AND (event_ts, event_id) < ($3, $4)
-			ORDER BY event_ts DESC, event_id DESC
-			LIMIT $5`,
-			entityType, entityID, cursor.EventTS, cursor.EventID, fetchLimit,
+			SELECT event_id, icao24, callsign, origin_country, observed_at, position_source,
+			       lat, lon, baro_altitude_m, geo_altitude_m, velocity_ms, true_track_deg,
+			       vertical_rate_ms, on_ground, squawk, spi, category, ingested_at
+			FROM flight_telemetry
+			WHERE icao24 = $1
+			  AND (observed_at, event_id) < ($2, $3)
+			ORDER BY observed_at DESC, event_id DESC
+			LIMIT $4`,
+			icao24, cursor.EventTS, cursor.EventID, fetchLimit,
 		)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("query raw_events: %w", err)
+		return nil, fmt.Errorf("query flight_telemetry: %w", err)
 	}
 	defer rows.Close()
 
-	events := make([]RawEvent, 0, fetchLimit)
+	out := make([]Telemetry, 0, fetchLimit)
 	for rows.Next() {
-		var e RawEvent
+		var t Telemetry
 		if err := rows.Scan(
-			&e.EventID, &e.EntityType, &e.EntityID, &e.EventTS,
-			&e.Lat, &e.Lon, &e.SpeedKmh, &e.HeadingDeg, &e.AccuracyM,
-			&e.Source, &e.Attributes, &e.IngestedAt,
+			&t.EventID, &t.Icao24, &t.Callsign, &t.OriginCountry, &t.ObservedAt, &t.PositionSource,
+			&t.Lat, &t.Lon, &t.BaroAltitudeM, &t.GeoAltitudeM, &t.VelocityMs, &t.TrueTrackDeg,
+			&t.VerticalRateMs, &t.OnGround, &t.Squawk, &t.Spi, &t.Category, &t.IngestedAt,
 		); err != nil {
-			return nil, fmt.Errorf("scan raw_events: %w", err)
+			return nil, fmt.Errorf("scan flight_telemetry: %w", err)
 		}
-		events = append(events, e)
+		out = append(out, t)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("rows error: %w", err)
 	}
 
-	page := &EventsPage{Events: events}
-	if len(events) > limit {
-		page.Events = events[:limit]
-		last := events[limit-1]
-		page.NextCursor = Cursor{EventTS: last.EventTS, EventID: last.EventID}.Encode()
+	page := &TrackPage{Telemetry: out}
+	if len(out) > limit {
+		page.Telemetry = out[:limit]
+		last := out[limit-1]
+		page.NextCursor = Cursor{EventTS: last.ObservedAt, EventID: last.EventID}.Encode()
 	}
 	return page, nil
 }

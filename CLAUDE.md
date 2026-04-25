@@ -39,23 +39,37 @@ loopback interface. To enable anonymous MinIO read on the lake bucket
   invocation reaching a non-local lake with `minioadmin`). For local
   dev: `S3_ACCESS_KEY=minioadmin S3_SECRET_KEY=minioadmin`.
 
+## OpenSky rate limit footgun
+
+- `services/opensky-ingest` polls `https://opensky-network.org/api/states/all`
+  on `POLL_INTERVAL_SECONDS` (default 300s). **Anonymous = 400 credits/day,
+  1 credit per call.** 300s = 288 polls/day, comfortably under the cap.
+  **Do NOT drop below ~215s** without OAuth2 client credentials
+  (4000 credits/day). The fetcher backs off exponentially on HTTP 429,
+  so a misconfigured deployment won't hammer OpenSky, but it WILL stop
+  ingesting until the 24h credit window resets.
+- `replicaCount` is hardcoded to 1 in `deploy/helm/opensky-ingest/templates/deployment.yaml`.
+  Multiple replicas would each independently poll and produce duplicates of
+  every observation; HA would need leader election (out of scope today).
+
 ## Kafka partitioning dictates scale-out
 
-- Topic `movement.events` has **3 partitions**. Per consumer group, at
+- Topic `flight.telemetry` has **3 partitions**. Per consumer group, at
   most 3 instances consume in parallel; a 4th sits idle with
   `#PARTITIONS = 0` (verify with
   `kafka-consumer-groups --describe --group <g> --members`).
-- The three sinks (`mobility-postgres`, `mobility-clickhouse`,
-  `mobility-iceberg`) are **independent consumer groups** and scale
+- The three sinks (`flight-postgres`, `flight-clickhouse`,
+  `flight-iceberg`) are **independent consumer groups** and scale
   independently.
 - Per-entity ordering (invariant I6) holds under scale-out because the
-  producer keys on `entity_type:entity_id` — same key → same partition
+  producer keys on `icao24` — same key → same partition
   → single consumer.
 
 ## Kubernetes / GitOps layout
 
-- The **compose stack owns infra**; the **kind cluster owns the four Go
-  services** (ingest-api, stream-processor, query-api, clickhouse-sink).
+- The **compose stack owns infra**; the **kind cluster owns the six
+  services** (4 Go: ingest-api, stream-processor, query-api,
+  clickhouse-sink; 2 Python: archiver, opensky-ingest).
   Kind pods reach compose infra via `host.docker.internal`. See
   `deploy/kind/kind-cluster.yaml` for node port mappings
   (30080→host:8080, 30443→host:8443).
@@ -82,7 +96,7 @@ loopback interface. To enable anonymous MinIO read on the lake bucket
 
 - Opt-in overlay compose:
   `docker compose -f deploy/docker-compose.yml
-  -f deploy/observability/docker-compose.observability.yml -p dream-mobility up -d`.
+  -f deploy/observability/docker-compose.observability.yml -p dream-flight up -d`.
 - OTel SDK is initialized in every `cmd/*/main.go`. The OTLP/HTTP
   exporter **must** use `otlptracehttp.WithInsecure()` against the
   local collector (the SDK defaults to HTTPS otherwise and every
@@ -98,9 +112,9 @@ loopback interface. To enable anonymous MinIO read on the lake bucket
   continues the trace into Iceberg writes — one trace ID now spans
   Go→Go→Python. clickhouse-sink is not yet instrumented.
 - Prometheus is reachable from Grafana at
-  `http://dm-prometheus:9090` (the docker-network hostname), not
+  `http://df-prometheus:9090` (the docker-network hostname), not
   `localhost`. Jaeger is reachable the same way at
-  `http://dm-jaeger:16686`. Datasources are provisioned by hand
+  `http://df-jaeger:16686`. Datasources are provisioned by hand
   today (`curl -u admin:admin -X POST /api/datasources`).
 - Grafana runs with anonymous Viewer + `admin/admin` for edit. Dev-only.
 - `deploy/observability/prometheus.yml` statically scrapes three

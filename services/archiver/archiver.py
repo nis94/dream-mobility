@@ -1,11 +1,11 @@
 """
-Kafka → Iceberg/Parquet archiver for the Dream Mobility pipeline.
+Kafka → Iceberg/Parquet archiver for the Dream Flight pipeline.
 
-Consumes movement events from Kafka, buffers them in memory, and flushes
+Consumes flight telemetry from Kafka, buffers it in memory, and flushes
 to an Apache Iceberg table backed by MinIO/S3 in Parquet format.
 
-The Iceberg table is partitioned by days(event_ts) and entity_type for
-efficient time-range and entity-scoped queries.
+The Iceberg table is partitioned by days(observed_at) and origin_country —
+both are highly selective ("UK flights last week" prunes ~95% of files).
 
 Usage:
     uv run python archiver.py
@@ -13,7 +13,7 @@ Usage:
 
 Environment variables (override CLI defaults):
     KAFKA_BROKERS           Kafka bootstrap servers (default: localhost:29092)
-    KAFKA_TOPIC             Topic to consume (default: movement.events)
+    KAFKA_TOPIC             Topic to consume (default: flight.telemetry)
     ICEBERG_CATALOG_URI     Iceberg REST catalog URI (default: http://localhost:8181)
     ICEBERG_WAREHOUSE       S3 warehouse path (default: s3://lake/)
     S3_ENDPOINT             MinIO/S3 endpoint (default: http://localhost:9100)
@@ -50,7 +50,9 @@ from pyiceberg.schema import Schema
 from pyiceberg.table.sorting import NullOrder, SortDirection, SortField, SortOrder
 from pyiceberg.transforms import DayTransform, IdentityTransform
 from pyiceberg.types import (
+    BooleanType,
     DoubleType,
+    IntegerType,
     NestedField,
     StringType,
     TimestamptzType,
@@ -87,36 +89,51 @@ def _extract_parent_context(headers: list[tuple[str, bytes]] | None):
     carrier = {k: v.decode("utf-8", errors="replace") for k, v in headers}
     return propagate.extract(carrier)
 
-# Arrow schema matching the Avro MovementEvent (flattened).
+# Arrow schema matching the Avro FlightTelemetry record. Field order MUST
+# match ICEBERG_SCHEMA below — Arrow → Iceberg conversion is positional.
 ARROW_SCHEMA = pa.schema([
     pa.field("event_id", pa.string(), nullable=False),
-    pa.field("entity_type", pa.string(), nullable=False),
-    pa.field("entity_id", pa.string(), nullable=False),
-    pa.field("event_ts", pa.timestamp("us", tz="UTC"), nullable=False),
+    pa.field("icao24", pa.string(), nullable=False),
+    pa.field("callsign", pa.string(), nullable=True),
+    pa.field("origin_country", pa.string(), nullable=False),
+    pa.field("observed_at", pa.timestamp("us", tz="UTC"), nullable=False),
+    pa.field("position_source", pa.string(), nullable=False),
     pa.field("lat", pa.float64(), nullable=False),
     pa.field("lon", pa.float64(), nullable=False),
-    pa.field("speed_kmh", pa.float64(), nullable=True),
-    pa.field("heading_deg", pa.float64(), nullable=True),
-    pa.field("accuracy_m", pa.float64(), nullable=True),
-    pa.field("source", pa.string(), nullable=True),
-    pa.field("attributes", pa.string(), nullable=True),
+    pa.field("baro_altitude_m", pa.float64(), nullable=True),
+    pa.field("geo_altitude_m", pa.float64(), nullable=True),
+    pa.field("velocity_ms", pa.float64(), nullable=True),
+    pa.field("true_track_deg", pa.float64(), nullable=True),
+    pa.field("vertical_rate_ms", pa.float64(), nullable=True),
+    pa.field("on_ground", pa.bool_(), nullable=False),
+    pa.field("squawk", pa.string(), nullable=True),
+    pa.field("spi", pa.bool_(), nullable=False),
+    pa.field("category", pa.int32(), nullable=True),
     pa.field("ingested_at", pa.timestamp("us", tz="UTC"), nullable=False),
 ])
 
-# Iceberg schema for table creation.
+# Iceberg schema. Field IDs renumbered cleanly 1..N matching Avro field order
+# so a fresh table create is unambiguous; never reuse an old ID across schema
+# evolutions because Iceberg metadata keys files by field ID, not by name.
 ICEBERG_SCHEMA = Schema(
     NestedField(1, "event_id", StringType(), required=True),
-    NestedField(2, "entity_type", StringType(), required=True),
-    NestedField(3, "entity_id", StringType(), required=True),
-    NestedField(4, "event_ts", TimestamptzType(), required=True),
-    NestedField(5, "lat", DoubleType(), required=True),
-    NestedField(6, "lon", DoubleType(), required=True),
-    NestedField(7, "speed_kmh", DoubleType(), required=False),
-    NestedField(8, "heading_deg", DoubleType(), required=False),
-    NestedField(9, "accuracy_m", DoubleType(), required=False),
-    NestedField(10, "source", StringType(), required=False),
-    NestedField(11, "attributes", StringType(), required=False),
-    NestedField(12, "ingested_at", TimestamptzType(), required=True),
+    NestedField(2, "icao24", StringType(), required=True),
+    NestedField(3, "callsign", StringType(), required=False),
+    NestedField(4, "origin_country", StringType(), required=True),
+    NestedField(5, "observed_at", TimestamptzType(), required=True),
+    NestedField(6, "position_source", StringType(), required=True),
+    NestedField(7, "lat", DoubleType(), required=True),
+    NestedField(8, "lon", DoubleType(), required=True),
+    NestedField(9, "baro_altitude_m", DoubleType(), required=False),
+    NestedField(10, "geo_altitude_m", DoubleType(), required=False),
+    NestedField(11, "velocity_ms", DoubleType(), required=False),
+    NestedField(12, "true_track_deg", DoubleType(), required=False),
+    NestedField(13, "vertical_rate_ms", DoubleType(), required=False),
+    NestedField(14, "on_ground", BooleanType(), required=True),
+    NestedField(15, "squawk", StringType(), required=False),
+    NestedField(16, "spi", BooleanType(), required=True),
+    NestedField(17, "category", IntegerType(), required=False),
+    NestedField(18, "ingested_at", TimestamptzType(), required=True),
 )
 
 
@@ -130,7 +147,7 @@ def _get_avro_schema():
         import fastavro
 
         schema_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "internal", "avro", "movement_event.avsc"
+            os.path.dirname(__file__), "..", "..", "internal", "avro", "flight_telemetry.avsc"
         )
         with open(schema_path) as f:
             _avro_schema = fastavro.parse_schema(json.load(f))
@@ -159,30 +176,35 @@ def decode_avro_event(raw: bytes) -> dict[str, Any] | None:
 
 
 def _avro_record_to_dict(rec: dict[str, Any]) -> dict[str, Any]:
-    """Map the Avro record to our flat dict. fastavro decodes
-    `timestamp-micros` as a timezone-aware `datetime`, so we take it as-is
-    (older code that divided by 1_000_000 assumed an int and blew up).
+    """Map the Avro FlightTelemetry record to a flat dict matching ARROW_SCHEMA.
+    fastavro decodes `timestamp-micros` as a timezone-aware `datetime`, so we
+    take it as-is.
     """
-    # fastavro decodes timestamp-micros as a timezone-aware datetime. The
-    # int-division fallback is defensive for older fastavro versions and
-    # assumes micros-since-epoch if the wire format ever changes.
-    ts = rec["timestamp"]
-    event_ts = ts if isinstance(ts, datetime) else datetime.fromtimestamp(ts / 1_000_000, tz=UTC)
+    ts = rec["observed_at"]
+    observed_at = (
+        ts if isinstance(ts, datetime) else datetime.fromtimestamp(ts / 1_000_000, tz=UTC)
+    )
 
     # fastavro returns uuid.UUID for logicalType=uuid; Arrow expects string.
     # str() is a no-op on strings so we skip the isinstance branch.
     return {
         "event_id": str(rec["event_id"]),
-        "entity_type": rec["entity_type"],
-        "entity_id": rec["entity_id"],
-        "event_ts": event_ts,
+        "icao24": rec["icao24"],
+        "callsign": rec.get("callsign"),
+        "origin_country": rec["origin_country"],
+        "observed_at": observed_at,
+        "position_source": rec["position_source"],
         "lat": rec["lat"],
         "lon": rec["lon"],
-        "speed_kmh": rec.get("speed_kmh"),
-        "heading_deg": rec.get("heading_deg"),
-        "accuracy_m": rec.get("accuracy_m"),
-        "source": rec.get("source"),
-        "attributes": rec.get("attributes"),
+        "baro_altitude_m": rec.get("baro_altitude_m"),
+        "geo_altitude_m": rec.get("geo_altitude_m"),
+        "velocity_ms": rec.get("velocity_ms"),
+        "true_track_deg": rec.get("true_track_deg"),
+        "vertical_rate_ms": rec.get("vertical_rate_ms"),
+        "on_ground": rec["on_ground"],
+        "squawk": rec.get("squawk"),
+        "spi": rec["spi"],
+        "category": rec.get("category"),
         "ingested_at": datetime.now(UTC),
     }
 
@@ -197,7 +219,7 @@ class IcebergArchiver:
         s3_endpoint: str,
         s3_access_key: str,
         s3_secret_key: str,
-        table_name: str = "mobility.raw_events",
+        table_name: str = "flight.telemetry",
         flush_size: int = 10000,
         flush_interval: float = 30.0,
         catalog_token: str | None = None,
@@ -234,22 +256,24 @@ class IcebergArchiver:
             self.table = self.catalog.load_table(self.table_name)
             log.info("loaded existing iceberg table: %s", self.table_name)
         except NoSuchTableError:
+            # Partition by day(observed_at) + identity(origin_country). Both
+            # are highly selective for typical queries — "UK flights last
+            # week" prunes ~95% of files. source_id values are the field IDs
+            # in ICEBERG_SCHEMA: observed_at=5, origin_country=4.
             partition_spec = PartitionSpec(
                 PartitionField(
-                    source_id=4, field_id=1000, transform=DayTransform(), name="event_day"
+                    source_id=5, field_id=1000, transform=DayTransform(), name="observed_day"
                 ),
                 PartitionField(
-                    source_id=2, field_id=1001, transform=IdentityTransform(), name="entity_type"
+                    source_id=4, field_id=1001, transform=IdentityTransform(), name="origin_country"
                 ),
             )
-            # Sort by event_ts within each partition so Parquet row groups are
-            # time-clustered and reader-side min/max pruning on time-range
-            # queries stays tight as the table grows. Without this, row groups
-            # within a single day-partition are written in arrival order,
-            # which for out-of-order ingest defeats pruning.
+            # Sort by observed_at within each partition so Parquet row groups
+            # are time-clustered and reader-side min/max pruning on time-range
+            # queries stays tight as the table grows.
             sort_order = SortOrder(
                 SortField(
-                    source_id=4,
+                    source_id=5,
                     transform=IdentityTransform(),
                     direction=SortDirection.ASC,
                     null_order=NullOrder.NULLS_LAST,
@@ -405,8 +429,8 @@ def run(args: argparse.Namespace) -> None:
                 event = decode_avro_event(msg.value())
                 if event is not None:
                     span.set_attribute("event.id", event["event_id"])
-                    span.set_attribute("entity.type", event["entity_type"])
-                    span.set_attribute("entity.id", event["entity_id"])
+                    span.set_attribute("aircraft.icao24", event["icao24"])
+                    span.set_attribute("aircraft.origin_country", event["origin_country"])
                     # add() returns True when it triggered a size-based flush.
                     flushed = archiver.add(event)
                     if not flushed and archiver.should_flush():
@@ -458,8 +482,8 @@ def _safe_commit(consumer: Consumer) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Kafka → Iceberg archiver")
     p.add_argument("--bootstrap-servers", default=os.getenv("KAFKA_BROKERS", "localhost:29092"))
-    p.add_argument("--topic", default=os.getenv("KAFKA_TOPIC", "movement.events"))
-    p.add_argument("--group-id", default="mobility-iceberg")
+    p.add_argument("--topic", default=os.getenv("KAFKA_TOPIC", "flight.telemetry"))
+    p.add_argument("--group-id", default="flight-iceberg")
     p.add_argument("--catalog-uri", default=os.getenv("ICEBERG_CATALOG_URI", "http://localhost:8181"))
     p.add_argument("--warehouse", default=os.getenv("ICEBERG_WAREHOUSE", "s3://lake/"))
     p.add_argument("--s3-endpoint", default=os.getenv("S3_ENDPOINT", "http://localhost:9100"))

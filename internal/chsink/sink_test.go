@@ -9,7 +9,7 @@ func TestSplitStatements_StripsCommentsAndBlanks(t *testing.T) {
 	in := `-- leading comment
 -- another comment
 
-CREATE DATABASE mobility;
+CREATE DATABASE flight;
 
 -- inline comment line
 CREATE TABLE foo (id String) ENGINE = MergeTree() ORDER BY id;

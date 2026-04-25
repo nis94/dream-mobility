@@ -1,31 +1,39 @@
 """
-Synthetic movement event generator for the Dream Mobility ingestion pipeline.
+Synthetic flight telemetry generator for the Dream Flight pipeline.
+
+Now repurposed as a load / chaos tool — opensky-ingest is the primary data
+source. This script remains the only deterministic way to test:
+  * --duplicates       (replay a recent event with the same event_id)
+  * --out-of-order     (shift observed_at backwards to test the timestamp
+                        upsert gate)
 
 Emits JSON events shaped like:
 
     {
       "event_id": "<uuid>",
-      "entity": {"type": "vehicle", "id": "vehicle-7"},
-      "timestamp": "2025-01-01T10:15:00Z",
-      "position": {"lat": 52.5200, "lon": 13.4050},
-      "speed_kmh": 42.3,
-      "source": "gps",
-      "attributes": {"battery_level": 0.82}
+      "icao24": "abc123",
+      "callsign": "BAW123",
+      "origin_country": "GB",
+      "observed_at": "2025-01-01T10:15:00Z",
+      "position_source": "ADSB",
+      "lat": 52.52, "lon": 13.40,
+      "baro_altitude_m": 11000.0,
+      "velocity_ms": 245.5,
+      "true_track_deg": 90.0,
+      "vertical_rate_ms": 0.0,
+      "on_ground": false,
+      "spi": false
     }
 
-Models:
-- A pool of N entities, each performing a random walk around a starting point.
-- Optional duplicate injection: with probability p_dup, an emitted event is
-  re-sent shortly after with the same event_id (tests dedupe).
-- Optional out-of-order injection: with probability p_ooo, an emitted event's
-  timestamp is shifted backwards by up to `out_of_order_window_s` seconds,
-  simulating a late-arriving event (tests timestamp-gated upsert).
+Models a pool of N synthetic aircraft. Each one has a fixed icao24 hex ID, a
+callsign with the airline prefix, an origin country, and a random walk in
+lat/lon. Altitude/velocity/heading sampled per emission.
 
 Output targets:
 - "stdout"                         (default) -- one JSON object per line
-- "file:./events.jsonl"            -- write to a JSONL file
-- "http://host:port/events"        -- POST one-by-one (Phase 2+)
-- "http://host:port/events:batch"  -- POST as a batch (Phase 2+)
+- "file:./events.jsonl"            -- JSONL file
+- "http://host:port/events"        -- POST one-by-one to ingest-api
+- "http://host:port/events:batch"  -- POST as a batch
 
 Run:
     uv run python gen.py --rate 100 --duration 30 --duplicates 0.05 --out-of-order 0.10
@@ -49,39 +57,67 @@ import httpx
 
 log = logging.getLogger("generator")
 
-# A handful of plausible base coordinates (Berlin, NYC, Tokyo, TLV, SF).
+# Base coordinates over major air-traffic regions (UK, Germany, France, US East,
+# US West). Each synthetic aircraft starts within ±2° of one of these.
 BASE_COORDS: list[tuple[float, float]] = [
-    (52.5200, 13.4050),
-    (40.7128, -74.0060),
-    (35.6762, 139.6503),
-    (32.0853, 34.7818),
-    (37.7749, -122.4194),
+    (51.5, -0.5),     # London
+    (50.0, 8.5),      # Frankfurt
+    (48.85, 2.35),    # Paris
+    (40.7, -74.0),    # NYC
+    (37.6, -122.4),   # SF
 ]
 
-ENTITY_TYPES: list[str] = ["vehicle", "courier", "scooter", "device"]
+# (airline ICAO prefix, country) — 3-char prefix is the canonical operator
+# code; downstream rollups slice by it.
+AIRLINES: list[tuple[str, str]] = [
+    ("BAW", "United Kingdom"),
+    ("DLH", "Germany"),
+    ("AFR", "France"),
+    ("UAL", "United States"),
+    ("AAL", "United States"),
+    ("KLM", "Netherlands"),
+    ("IBE", "Spain"),
+    ("SWR", "Switzerland"),
+    ("AUA", "Austria"),
+    ("SAS", "Sweden"),
+]
+
+POSITION_SOURCES: list[str] = ["ADSB", "MLAT", "ASTERIX", "FLARM"]
 
 
 @dataclass
-class Entity:
-    """One entity performing a random walk in lat/lon space."""
+class Aircraft:
+    """One synthetic aircraft performing a random walk at cruise altitude."""
 
-    type: str
-    id: str
+    icao24: str
+    callsign: str
+    origin_country: str
     lat: float
     lon: float
-    heading_deg: float
-    speed_kmh: float
+    true_track_deg: float
+    velocity_ms: float
+    altitude_m: float
+    vertical_rate_ms: float
+    on_ground: bool
 
     def step(self, dt_s: float) -> None:
         # Random walk: small heading & speed jitter, then advance position.
-        self.heading_deg = (self.heading_deg + random.uniform(-15.0, 15.0)) % 360.0
-        self.speed_kmh = max(0.0, min(120.0, self.speed_kmh + random.uniform(-3.0, 3.0)))
-        # ~111 km per degree of latitude; longitude scaled by cos(lat). Good enough for fake data.
-        distance_km = self.speed_kmh * (dt_s / 3600.0)
+        # Aviation cruise speeds: 200-280 m/s (720-1000 km/h). Light planes
+        # 50-80 m/s. Range covers both.
+        self.true_track_deg = (self.true_track_deg + random.uniform(-5.0, 5.0)) % 360.0
+        self.velocity_ms = max(40.0, min(280.0, self.velocity_ms + random.uniform(-5.0, 5.0)))
+        # Altitude drift: small most of the time, occasional climb/descent.
+        if random.random() < 0.05:
+            self.vertical_rate_ms = random.uniform(-15.0, 15.0)
+        else:
+            self.vertical_rate_ms *= 0.7  # decay
+        self.altitude_m = max(0.0, min(13000.0, self.altitude_m + self.vertical_rate_ms * dt_s))
+        # Position update. Aircraft cover ~1 m / m/s / s ground distance;
+        # converting to lat/lon at the equator: 1° lat ≈ 111 km.
+        distance_km = self.velocity_ms * dt_s / 1000.0
         d_lat = distance_km / 111.0
         d_lon = distance_km / (111.0 * max(0.1, abs(_cos_deg(self.lat))))
-        # Project along heading (0=N, 90=E)
-        rad = _deg_to_rad(self.heading_deg)
+        rad = _deg_to_rad(self.true_track_deg)
         self.lat += d_lat * _cos(rad)
         self.lon += d_lon * _sin(rad)
 
@@ -102,43 +138,66 @@ def _cos_deg(d: float) -> float:
     return _cos(_deg_to_rad(d))
 
 
-def make_entities(count: int, rng: random.Random) -> list[Entity]:
-    entities: list[Entity] = []
+def make_aircraft(count: int, rng: random.Random) -> list[Aircraft]:
+    """Build N synthetic aircraft. Each gets a stable icao24 hex (used as
+    Kafka partition key downstream, so per-aircraft ordering is preserved)."""
+    aircraft: list[Aircraft] = []
     for i in range(count):
-        etype = rng.choice(ENTITY_TYPES)
+        # 6-char lowercase hex; deterministic per index given the seed.
+        icao24 = f"{(0xa00000 + i):06x}"
+        prefix, country = rng.choice(AIRLINES)
+        callsign = f"{prefix}{rng.randint(100, 9999)}"
         base_lat, base_lon = rng.choice(BASE_COORDS)
-        entities.append(
-            Entity(
-                type=etype,
-                id=f"{etype}-{i}",
-                lat=base_lat + rng.uniform(-0.05, 0.05),
-                lon=base_lon + rng.uniform(-0.05, 0.05),
-                heading_deg=rng.uniform(0.0, 360.0),
-                speed_kmh=rng.uniform(0.0, 60.0),
+        on_ground = rng.random() < 0.05  # ~5% on the ground
+        aircraft.append(
+            Aircraft(
+                icao24=icao24,
+                callsign=callsign,
+                origin_country=country,
+                lat=base_lat + rng.uniform(-2.0, 2.0),
+                lon=base_lon + rng.uniform(-2.0, 2.0),
+                true_track_deg=rng.uniform(0.0, 360.0),
+                velocity_ms=rng.uniform(80.0, 260.0),
+                altitude_m=0.0 if on_ground else rng.uniform(3000.0, 12000.0),
+                vertical_rate_ms=0.0,
+                on_ground=on_ground,
             )
         )
-    return entities
+    return aircraft
 
 
-def event_from(entity: Entity, when: datetime, rng: random.Random) -> dict[str, Any]:
-    """Build one event dict from an entity's current state."""
+def event_from(ac: Aircraft, when: datetime, rng: random.Random) -> dict[str, Any]:
+    """Build one event dict from an aircraft's current state."""
     payload: dict[str, Any] = {
         "event_id": str(uuid.uuid4()),
-        "entity": {"type": entity.type, "id": entity.id},
-        "timestamp": when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-        "position": {"lat": round(entity.lat, 6), "lon": round(entity.lon, 6)},
+        "icao24": ac.icao24,
+        "callsign": ac.callsign,
+        "origin_country": ac.origin_country,
+        "observed_at": when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "position_source": rng.choice(POSITION_SOURCES),
+        "lat": round(ac.lat, 6),
+        "lon": round(ac.lon, 6),
+        "on_ground": ac.on_ground,
+        "spi": False,
     }
-    # Optional fields, sometimes omitted (mirrors the "optional or missing fields" spec).
-    if rng.random() < 0.9:
-        payload["speed_kmh"] = round(entity.speed_kmh, 2)
-    if rng.random() < 0.7:
-        payload["heading_deg"] = round(entity.heading_deg, 2)
-    if rng.random() < 0.5:
-        payload["accuracy_m"] = round(rng.uniform(1.0, 25.0), 2)
-    if rng.random() < 0.8:
-        payload["source"] = rng.choice(["gps", "wifi", "cell"])
-    if rng.random() < 0.4:
-        payload["attributes"] = {"battery_level": round(rng.uniform(0.05, 1.0), 2)}
+    # Most fields are reported by ADS-B but a few drop out periodically.
+    if not ac.on_ground:
+        if rng.random() < 0.95:
+            payload["baro_altitude_m"] = round(ac.altitude_m, 1)
+        if rng.random() < 0.85:
+            payload["geo_altitude_m"] = round(ac.altitude_m + rng.uniform(-50.0, 50.0), 1)
+        if rng.random() < 0.95:
+            payload["velocity_ms"] = round(ac.velocity_ms, 2)
+        if rng.random() < 0.95:
+            payload["true_track_deg"] = round(ac.true_track_deg, 2)
+        if rng.random() < 0.90:
+            payload["vertical_rate_ms"] = round(ac.vertical_rate_ms, 2)
+    if rng.random() < 0.30:
+        # 4 octal digits (0-7). Realistic distribution skews toward
+        # everyday ATC codes (1200, 2000-7000); we don't need that fidelity.
+        payload["squawk"] = "".join(str(rng.randint(0, 7)) for _ in range(4))
+    if rng.random() < 0.20:
+        payload["category"] = rng.randint(0, 11)
     return payload
 
 
@@ -213,7 +272,7 @@ def make_sink(target: str) -> Sink:
 
 async def run(args: argparse.Namespace) -> None:
     rng = random.Random(args.seed)
-    entities = make_entities(args.entities, rng)
+    aircraft = make_aircraft(args.entities, rng)
     sink = make_sink(args.target)
 
     end_at = datetime.now(UTC) + timedelta(seconds=args.duration) if args.duration > 0 else None
@@ -227,7 +286,7 @@ async def run(args: argparse.Namespace) -> None:
 
     tick_interval = 1.0 / max(1.0, args.rate / max(1, args.batch_size))
     log.info(
-        "starting: entities=%d rate=%d/s batch=%d target=%s duration=%s",
+        "starting: aircraft=%d rate=%d/s batch=%d target=%s duration=%s",
         args.entities,
         args.rate,
         args.batch_size,
@@ -239,29 +298,29 @@ async def run(args: argparse.Namespace) -> None:
             if end_at is not None and datetime.now(UTC) >= end_at:
                 break
 
-            # Step the simulation by ~1s per emission tick (independent of wall clock cadence).
-            for ent in entities:
-                ent.step(dt_s=1.0)
+            # Step the simulation by ~1s per tick (independent of wall clock).
+            for ac in aircraft:
+                ac.step(dt_s=1.0)
 
             now = datetime.now(UTC)
             batch: list[dict[str, Any]] = []
             for _ in range(args.batch_size):
-                # Either emit a duplicate of a recently-seen event (keeping
-                # batch size honest: one roll → one slot), or build a fresh
-                # event. On the first few iterations `recent` is empty, so
-                # the duplicate branch never fires.
+                # Replay a recent event (same event_id) with probability
+                # --duplicates. The first few ticks have an empty buffer so
+                # the duplicate branch never fires until we've emitted
+                # something fresh.
                 if recent and rng.random() < args.duplicates:
                     batch.append(rng.choice(recent))
                     duplicates_emitted += 1
                     continue
 
-                ent = rng.choice(entities)
+                ac = rng.choice(aircraft)
                 ts = now
                 if rng.random() < args.out_of_order:
                     shift = rng.uniform(1.0, args.out_of_order_window_s)
                     ts = now - timedelta(seconds=shift)
                     out_of_order_emitted += 1
-                ev = event_from(ent, ts, rng)
+                ev = event_from(ac, ts, rng)
                 batch.append(ev)
 
                 recent.append(ev)
@@ -286,10 +345,10 @@ async def run(args: argparse.Namespace) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Dream Mobility synthetic event generator")
+    p = argparse.ArgumentParser(description="Dream Flight synthetic telemetry generator")
     p.add_argument("--rate", type=int, default=50, help="Events per second (target)")
     p.add_argument("--batch-size", type=int, default=10, help="Events emitted per tick")
-    p.add_argument("--entities", type=int, default=20, help="Number of distinct entities")
+    p.add_argument("--entities", type=int, default=20, help="Number of distinct aircraft")
     p.add_argument(
         "--duration",
         type=int,

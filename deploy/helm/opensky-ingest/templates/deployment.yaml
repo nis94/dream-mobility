@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-opensky-ingest
+  labels:
+    app: opensky-ingest
+    release: {{ .Release.Name }}
+spec:
+  # Hardcoded to 1 — running multiple replicas would have each pod
+  # independently poll OpenSky and produce its own duplicates of every
+  # observation. There is no leader-election today; if HA matters later,
+  # gate the poll loop behind a leader lease.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opensky-ingest
+      release: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: opensky-ingest
+        release: {{ .Release.Name }}
+      # No prometheus.io/scrape annotation — this service has no /metrics
+      # endpoint today. Adding the annotation would just give Prometheus a
+      # permanently-failing target.
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: opensky-ingest
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            {{- range $key, $value := .Values.env }}
+            {{- if and $.Values.openskySecret (or (eq $key "OPENSKY_CLIENT_ID") (eq $key "OPENSKY_CLIENT_SECRET")) }}
+            {{- /* Skip inline creds when a Secret reference is provided. */ -}}
+            {{- else }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.openskySecret }}
+            - name: OPENSKY_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.openskySecret.name }}
+                  key: {{ .Values.openskySecret.clientIdKey | default "clientId" }}
+            - name: OPENSKY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.openskySecret.name }}
+                  key: {{ .Values.openskySecret.clientSecretKey | default "clientSecret" }}
+            {{- end }}
+          # Liveness via pgrep; same rationale as the archiver chart. There
+          # is no HTTP port to probe and no readiness signal worth gating
+          # traffic on (no traffic).
+          livenessProbe:
+            exec:
+              command:
+                - pgrep
+                - -f
+                - opensky_ingest.py
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            # readOnlyRootFilesystem=true forces a writable /tmp for any
+            # transient temp-file usage by requests/urllib3 / fastavro.
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}

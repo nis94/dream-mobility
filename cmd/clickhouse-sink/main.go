@@ -1,8 +1,8 @@
-// Command clickhouse-sink consumes movement.events from Kafka and batches
+// Command clickhouse-sink consumes flight.telemetry from Kafka and batches
 // writes into ClickHouse. The consumer loop owns the batch buffer, the
 // flush timer, AND the Kafka offset commit — so a batch's offset is only
 // committed AFTER the ClickHouse INSERT succeeds, preserving at-least-once
-// with zero data loss under the Phase 5 audit contract.
+// with zero data loss.
 package main
 
 import (
@@ -17,11 +17,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nis94/dream-mobility/internal/chsink"
-	"github.com/nis94/dream-mobility/internal/config"
-	"github.com/nis94/dream-mobility/internal/kafkametrics"
-	otelinit "github.com/nis94/dream-mobility/internal/otel"
-	"github.com/nis94/dream-mobility/internal/processor"
+	"github.com/nis94/dream-flight/internal/chsink"
+	"github.com/nis94/dream-flight/internal/config"
+	"github.com/nis94/dream-flight/internal/kafkametrics"
+	otelinit "github.com/nis94/dream-flight/internal/otel"
+	"github.com/nis94/dream-flight/internal/processor"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -34,7 +34,7 @@ var (
 	metricsInterval = 5 * time.Second
 	flushOnClose    = 10 * time.Second
 	serviceName     = "clickhouse-sink"
-	defaultGroupID  = "mobility-clickhouse"
+	defaultGroupID  = "flight-clickhouse"
 )
 
 const (
@@ -100,7 +100,7 @@ func run(logger *slog.Logger) error {
 	}()
 
 	groupID := cfg.KafkaGroupID
-	if groupID == "" || groupID == "mobility-postgres" {
+	if groupID == "" || groupID == "flight-postgres" {
 		// If the user didn't override, fall back to the sink's own default
 		// rather than inheriting the Postgres group id by accident.
 		groupID = defaultGroupID
@@ -213,7 +213,7 @@ func consumeLoop(
 			}
 
 		case msg := <-msgCase:
-			event, err := processor.DecodeMovementEvent(msg.Value)
+			event, err := processor.DecodeFlightTelemetry(msg.Value)
 			if err != nil {
 				metrics.IncDecodeFailure()
 				logger.Warn("decode failed, skipping",

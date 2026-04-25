@@ -1,35 +1,27 @@
 package api
 
-import "encoding/json"
-
-// EventRequest is the JSON shape arriving from external clients, matching the
-// task spec. Nested entity/position objects are flattened to the Avro schema
-// in the handler.
+// EventRequest is the JSON shape arriving from external clients (smoke tests,
+// the synthetic generator, future external producers). The aviation schema is
+// flat — there's no per-field nesting like the old entity:/position: wrappers,
+// because every field belongs to a single observation about one aircraft.
 type EventRequest struct {
-	EventID    string          `json:"event_id"`
-	Entity     EntityField     `json:"entity"`
-	Timestamp  string          `json:"timestamp"`
-	Position   PositionField   `json:"position"`
-	SpeedKmh   *float64        `json:"speed_kmh,omitempty"`
-	HeadingDeg *float64        `json:"heading_deg,omitempty"`
-	AccuracyM  *float64        `json:"accuracy_m,omitempty"`
-	Source     *string         `json:"source,omitempty"`
-	Attributes json.RawMessage `json:"attributes,omitempty"`
-}
-
-// EntityField is the nested "entity" object of an EventRequest: the kind and
-// identifier of the moving thing. Flattened to entity_type + entity_id in the
-// Avro record.
-type EntityField struct {
-	Type string `json:"type"`
-	ID   string `json:"id"`
-}
-
-// PositionField is the nested "position" object of an EventRequest:
-// a WGS-84 coordinate. Flattened to lat + lon in the Avro record.
-type PositionField struct {
-	Lat float64 `json:"lat"`
-	Lon float64 `json:"lon"`
+	EventID        string   `json:"event_id"`
+	Icao24         string   `json:"icao24"`
+	Callsign       *string  `json:"callsign,omitempty"`
+	OriginCountry  string   `json:"origin_country"`
+	ObservedAt     string   `json:"observed_at"`
+	PositionSource string   `json:"position_source"`
+	Lat            float64  `json:"lat"`
+	Lon            float64  `json:"lon"`
+	BaroAltitudeM  *float64 `json:"baro_altitude_m,omitempty"`
+	GeoAltitudeM   *float64 `json:"geo_altitude_m,omitempty"`
+	VelocityMs     *float64 `json:"velocity_ms,omitempty"`
+	TrueTrackDeg   *float64 `json:"true_track_deg,omitempty"`
+	VerticalRateMs *float64 `json:"vertical_rate_ms,omitempty"`
+	OnGround       bool     `json:"on_ground"`
+	Squawk         *string  `json:"squawk,omitempty"`
+	Spi            bool     `json:"spi,omitempty"`
+	Category       *int     `json:"category,omitempty"`
 }
 
 // BatchRequest wraps multiple events for the batch ingestion path.

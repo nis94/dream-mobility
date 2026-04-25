@@ -13,17 +13,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nis94/dream-mobility/internal/avro"
+	"github.com/nis94/dream-flight/internal/avro"
 )
 
 // fakeProducer implements eventProducer for handler tests.
 type fakeProducer struct {
 	calls    int
-	produced []*avro.MovementEvent
+	produced []*avro.FlightTelemetry
 	err      error
 }
 
-func (f *fakeProducer) Produce(_ context.Context, e *avro.MovementEvent) error {
+func (f *fakeProducer) Produce(_ context.Context, e *avro.FlightTelemetry) error {
 	f.calls++
 	if f.err != nil {
 		return f.err
@@ -40,14 +40,21 @@ func newTestHandler(prod eventProducer) *Handler {
 	return NewHandler(prod, silentLogger())
 }
 
+func ptr[T any](v T) *T { return &v }
+
 // ---- parseEventsFromBytes ---------------------------------------------------
 
 func TestParseRequestBody_SingleEvent(t *testing.T) {
 	body := `{
 		"event_id": "abc-123",
-		"entity": {"type": "vehicle", "id": "v1"},
-		"timestamp": "2025-01-01T10:00:00Z",
-		"position": {"lat": 52.52, "lon": 13.405}
+		"icao24": "abc123",
+		"origin_country": "GB",
+		"observed_at": "2025-01-01T10:00:00Z",
+		"position_source": "ADSB",
+		"lat": 52.52,
+		"lon": 13.405,
+		"on_ground": false,
+		"spi": false
 	}`
 	events, err := parseEventsFromBytes([]byte(body))
 	if err != nil {
@@ -59,12 +66,15 @@ func TestParseRequestBody_SingleEvent(t *testing.T) {
 	if events[0].EventID != "abc-123" {
 		t.Errorf("event_id = %q, want %q", events[0].EventID, "abc-123")
 	}
+	if events[0].Icao24 != "abc123" {
+		t.Errorf("icao24 = %q, want %q", events[0].Icao24, "abc123")
+	}
 }
 
 func TestParseRequestBody_BatchWrapper(t *testing.T) {
 	body := `{"events": [
-		{"event_id": "a", "entity": {"type": "v", "id": "1"}, "timestamp": "2025-01-01T10:00:00Z", "position": {"lat": 0, "lon": 0}},
-		{"event_id": "b", "entity": {"type": "v", "id": "2"}, "timestamp": "2025-01-01T10:00:00Z", "position": {"lat": 1, "lon": 1}}
+		{"event_id":"a","icao24":"aaaaaa","origin_country":"GB","observed_at":"2025-01-01T10:00:00Z","position_source":"ADSB","lat":0,"lon":0,"on_ground":false,"spi":false},
+		{"event_id":"b","icao24":"bbbbbb","origin_country":"DE","observed_at":"2025-01-01T10:00:00Z","position_source":"ADSB","lat":1,"lon":1,"on_ground":false,"spi":false}
 	]}`
 	events, err := parseEventsFromBytes([]byte(body))
 	if err != nil {
@@ -90,7 +100,7 @@ func TestParseRequestBody_EmptyBatchWrapper(t *testing.T) {
 
 func TestParseRequestBody_RawArray(t *testing.T) {
 	body := `[
-		{"event_id": "a", "entity": {"type": "v", "id": "1"}, "timestamp": "2025-01-01T10:00:00Z", "position": {"lat": 0, "lon": 0}}
+		{"event_id":"a","icao24":"aaaaaa","origin_country":"GB","observed_at":"2025-01-01T10:00:00Z","position_source":"ADSB","lat":0,"lon":0,"on_ground":false,"spi":false}
 	]`
 	events, err := parseEventsFromBytes([]byte(body))
 	if err != nil {
@@ -109,7 +119,7 @@ func TestParseRequestBody_EmptyBody(t *testing.T) {
 }
 
 func TestParseRequestBody_LeadingWhitespace(t *testing.T) {
-	body := "\n\t  {\"event_id\":\"x\",\"entity\":{\"type\":\"v\",\"id\":\"1\"},\"timestamp\":\"2025-01-01T10:00:00Z\",\"position\":{\"lat\":0,\"lon\":0}}"
+	body := "\n\t  {\"event_id\":\"x\",\"icao24\":\"abcdef\",\"origin_country\":\"GB\",\"observed_at\":\"2025-01-01T10:00:00Z\",\"position_source\":\"ADSB\",\"lat\":0,\"lon\":0,\"on_ground\":false,\"spi\":false}"
 	events, err := parseEventsFromBytes([]byte(body))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -123,12 +133,18 @@ func TestParseRequestBody_LeadingWhitespace(t *testing.T) {
 
 func TestMapToAvro(t *testing.T) {
 	ev := EventRequest{
-		EventID:   "abc-123",
-		Entity:    EntityField{Type: "vehicle", ID: "v1"},
-		Timestamp: "2025-01-01T10:15:00Z",
-		Position:  PositionField{Lat: 52.52, Lon: 13.405},
-		SpeedKmh:  ptr(42.3),
-		Source:    ptr("gps"),
+		EventID:        "abc-123",
+		Icao24:         "abc123",
+		Callsign:       ptr("BAW123"),
+		OriginCountry:  "GB",
+		ObservedAt:     "2025-01-01T10:15:00Z",
+		PositionSource: "ADSB",
+		Lat:            52.52,
+		Lon:            13.405,
+		BaroAltitudeM:  ptr(11000.0),
+		VelocityMs:     ptr(245.5),
+		TrueTrackDeg:   ptr(90.0),
+		OnGround:       false,
 	}
 	ts := time.Date(2025, 1, 1, 10, 15, 0, 0, time.UTC)
 
@@ -136,42 +152,29 @@ func TestMapToAvro(t *testing.T) {
 	if m.EventID != "abc-123" {
 		t.Errorf("EventID = %q, want %q", m.EventID, "abc-123")
 	}
-	if m.EntityType != "vehicle" {
-		t.Errorf("EntityType = %q, want %q", m.EntityType, "vehicle")
+	if m.Icao24 != "abc123" {
+		t.Errorf("Icao24 = %q, want %q", m.Icao24, "abc123")
 	}
-	if m.EntityID != "v1" {
-		t.Errorf("EntityID = %q, want %q", m.EntityID, "v1")
+	if m.Callsign == nil || *m.Callsign != "BAW123" {
+		t.Errorf("Callsign = %v, want BAW123", m.Callsign)
+	}
+	if m.OriginCountry != "GB" {
+		t.Errorf("OriginCountry = %q, want GB", m.OriginCountry)
+	}
+	if m.PositionSource != "ADSB" {
+		t.Errorf("PositionSource = %q, want ADSB", m.PositionSource)
 	}
 	if m.Lat != 52.52 || m.Lon != 13.405 {
 		t.Errorf("position = (%f, %f), want (52.52, 13.405)", m.Lat, m.Lon)
 	}
-	if m.SpeedKmh == nil || *m.SpeedKmh != 42.3 {
-		t.Errorf("SpeedKmh = %v, want 42.3", m.SpeedKmh)
+	if m.BaroAltitudeM == nil || *m.BaroAltitudeM != 11000.0 {
+		t.Errorf("BaroAltitudeM = %v, want 11000.0", m.BaroAltitudeM)
 	}
-	if m.Source == nil || *m.Source != "gps" {
-		t.Errorf("Source = %v, want gps", m.Source)
+	if m.VelocityMs == nil || *m.VelocityMs != 245.5 {
+		t.Errorf("VelocityMs = %v, want 245.5", m.VelocityMs)
 	}
-	if !m.Timestamp.Equal(ts) {
-		t.Errorf("Timestamp = %v, want %v", m.Timestamp, ts)
-	}
-}
-
-func TestMapToAvro_Attributes(t *testing.T) {
-	ev := EventRequest{
-		EventID:    "abc-123",
-		Entity:     EntityField{Type: "vehicle", ID: "v1"},
-		Timestamp:  "2025-01-01T10:15:00Z",
-		Position:   PositionField{Lat: 52.52, Lon: 13.405},
-		Attributes: []byte(`{"battery_level":0.82}`),
-	}
-	ts := time.Date(2025, 1, 1, 10, 15, 0, 0, time.UTC)
-
-	m := mapToAvro(&ev, ts)
-	if m.Attributes == nil {
-		t.Fatal("expected non-nil Attributes")
-	}
-	if *m.Attributes != `{"battery_level":0.82}` {
-		t.Errorf("Attributes = %q, want %q", *m.Attributes, `{"battery_level":0.82}`)
+	if !m.ObservedAt.Equal(ts) {
+		t.Errorf("ObservedAt = %v, want %v", m.ObservedAt, ts)
 	}
 }
 
@@ -180,9 +183,15 @@ func TestMapToAvro_Attributes(t *testing.T) {
 func validEventJSON() string {
 	return `{
 		"event_id": "abc-123",
-		"entity": {"type": "vehicle", "id": "v1"},
-		"timestamp": "` + time.Now().UTC().Format(time.RFC3339Nano) + `",
-		"position": {"lat": 52.52, "lon": 13.405}
+		"icao24": "abc123",
+		"callsign": "BAW123",
+		"origin_country": "GB",
+		"observed_at": "` + time.Now().UTC().Format(time.RFC3339Nano) + `",
+		"position_source": "ADSB",
+		"lat": 52.52,
+		"lon": 13.405,
+		"on_ground": false,
+		"spi": false
 	}`
 }
 
@@ -240,7 +249,6 @@ func TestIngest_OversizedBody(t *testing.T) {
 	prod := &fakeProducer{}
 	h := newTestHandler(prod)
 
-	// Build a body just over 10 MiB.
 	big := bytes.Repeat([]byte("x"), maxRequestBody+1)
 	req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewReader(big))
 	req.Header.Set("Content-Type", "application/json")
@@ -275,12 +283,10 @@ func TestIngest_BadContentType(t *testing.T) {
 }
 
 func TestIngest_MissingContentTypeIsAccepted(t *testing.T) {
-	// Empty Content-Type should be tolerated (curl default).
 	prod := &fakeProducer{}
 	h := newTestHandler(prod)
 
 	req := httptest.NewRequest(http.MethodPost, "/events", strings.NewReader(validEventJSON()))
-	// No Content-Type set.
 	rec := httptest.NewRecorder()
 
 	h.Ingest(rec, req)
@@ -294,7 +300,8 @@ func TestIngest_ValidationFailure(t *testing.T) {
 	prod := &fakeProducer{}
 	h := newTestHandler(prod)
 
-	bad := `{"event_id":"","entity":{"type":"v","id":"1"},"timestamp":"2025-01-01T10:00:00Z","position":{"lat":0,"lon":0}}`
+	// Missing event_id.
+	bad := `{"event_id":"","icao24":"abcdef","origin_country":"GB","observed_at":"2025-01-01T10:00:00Z","position_source":"ADSB","lat":0,"lon":0,"on_ground":false,"spi":false}`
 	req := httptest.NewRequest(http.MethodPost, "/events", strings.NewReader(bad))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -327,7 +334,6 @@ func TestIngest_ProducerError(t *testing.T) {
 	h.Ingest(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
-		// Accepted=0 + Rejected>0 flips to 400.
 		t.Errorf("status = %d, want 400 when all events fail to produce", rec.Code)
 	}
 	var resp IngestResponse
@@ -349,9 +355,9 @@ func TestIngest_MixedBatch(t *testing.T) {
 	// Three events: valid, invalid (bad lat), valid.
 	tsNow := time.Now().UTC().Format(time.RFC3339Nano)
 	body := `{"events":[
-		{"event_id":"a","entity":{"type":"v","id":"1"},"timestamp":"` + tsNow + `","position":{"lat":0,"lon":0}},
-		{"event_id":"b","entity":{"type":"v","id":"2"},"timestamp":"` + tsNow + `","position":{"lat":200,"lon":0}},
-		{"event_id":"c","entity":{"type":"v","id":"3"},"timestamp":"` + tsNow + `","position":{"lat":1,"lon":1}}
+		{"event_id":"a","icao24":"aaaaaa","origin_country":"GB","observed_at":"` + tsNow + `","position_source":"ADSB","lat":0,"lon":0,"on_ground":false,"spi":false},
+		{"event_id":"b","icao24":"bbbbbb","origin_country":"DE","observed_at":"` + tsNow + `","position_source":"ADSB","lat":200,"lon":0,"on_ground":false,"spi":false},
+		{"event_id":"c","icao24":"cccccc","origin_country":"FR","observed_at":"` + tsNow + `","position_source":"ADSB","lat":1,"lon":1,"on_ground":false,"spi":false}
 	]}`
 
 	req := httptest.NewRequest(http.MethodPost, "/events", strings.NewReader(body))

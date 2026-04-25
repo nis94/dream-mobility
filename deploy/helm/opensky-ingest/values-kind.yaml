@@ -1,0 +1,14 @@
+# values-kind.yaml — overrides for running opensky-ingest in kind against
+# docker-compose Kafka + Schema Registry on the host.
+
+image:
+  pullPolicy: Never
+
+env:
+  KAFKA_BROKERS: "host.docker.internal:39092"
+  KAFKA_TOPIC: "flight.telemetry"
+  SCHEMA_REGISTRY_URL: "http://host.docker.internal:8081"
+  OPENSKY_URL: "https://opensky-network.org/api/states/all"
+  POLL_INTERVAL_SECONDS: "300"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"
+  LOG_LEVEL: "DEBUG"

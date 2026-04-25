@@ -12,14 +12,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nis94/dream-mobility/internal/avro"
+	"github.com/nis94/dream-flight/internal/avro"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
-var tracer = otel.Tracer("github.com/nis94/dream-mobility/internal/api")
+var tracer = otel.Tracer("github.com/nis94/dream-flight/internal/api")
 
 // maxRequestBody caps the POST body size. Oversized requests are rejected with
 // HTTP 413 via http.MaxBytesReader's typed error.
@@ -29,7 +29,7 @@ const maxRequestBody = 10 << 20 // 10 MiB
 // Defined here (consumer side) so tests can supply a fake without pulling in
 // the real kafka.Writer machinery.
 type eventProducer interface {
-	Produce(ctx context.Context, event *avro.MovementEvent) error
+	Produce(ctx context.Context, event *avro.FlightTelemetry) error
 }
 
 // Handler serves the ingestion HTTP endpoints.
@@ -110,8 +110,8 @@ func (h *Handler) processOne(ctx context.Context, i int, ev *EventRequest, resp 
 
 	avroEvent := mapToAvro(ev, ts)
 	span.SetAttributes(
-		attribute.String("entity.type", avroEvent.EntityType),
-		attribute.String("entity.id", avroEvent.EntityID),
+		attribute.String("aircraft.icao24", avroEvent.Icao24),
+		attribute.String("aircraft.origin_country", avroEvent.OriginCountry),
 	)
 	if err := h.producer.Produce(ctx, avroEvent); err != nil {
 		span.SetStatus(codes.Error, "produce failed")
@@ -190,30 +190,30 @@ func parseEventsFromBytes(body []byte) ([]EventRequest, error) {
 	}
 }
 
-// mapToAvro converts the nested JSON request to the flat Avro struct.
-// ts is the already-parsed timestamp from ValidateEvent; avoids a redundant
-// time.Parse here.
-func mapToAvro(ev *EventRequest, ts time.Time) *avro.MovementEvent {
-	m := &avro.MovementEvent{
-		EventID:    ev.EventID,
-		EntityType: ev.Entity.Type,
-		EntityID:   ev.Entity.ID,
-		Timestamp:  ts,
-		Lat:        ev.Position.Lat,
-		Lon:        ev.Position.Lon,
-		SpeedKmh:   ev.SpeedKmh,
-		HeadingDeg: ev.HeadingDeg,
-		AccuracyM:  ev.AccuracyM,
-		Source:     ev.Source,
+// mapToAvro converts the JSON request to the Avro struct. ts is the already-
+// parsed timestamp from ValidateEvent; avoids a redundant time.Parse here.
+// The shapes are flat-to-flat now — every JSON field has a one-to-one Avro
+// counterpart.
+func mapToAvro(ev *EventRequest, ts time.Time) *avro.FlightTelemetry {
+	return &avro.FlightTelemetry{
+		EventID:        ev.EventID,
+		Icao24:         ev.Icao24,
+		Callsign:       ev.Callsign,
+		OriginCountry:  ev.OriginCountry,
+		ObservedAt:     ts,
+		PositionSource: ev.PositionSource,
+		Lat:            ev.Lat,
+		Lon:            ev.Lon,
+		BaroAltitudeM:  ev.BaroAltitudeM,
+		GeoAltitudeM:   ev.GeoAltitudeM,
+		VelocityMs:     ev.VelocityMs,
+		TrueTrackDeg:   ev.TrueTrackDeg,
+		VerticalRateMs: ev.VerticalRateMs,
+		OnGround:       ev.OnGround,
+		Squawk:         ev.Squawk,
+		Spi:            ev.Spi,
+		Category:       ev.Category,
 	}
-
-	// Attributes: store as JSON-encoded string if present.
-	if len(ev.Attributes) > 0 && string(ev.Attributes) != "null" {
-		s := string(ev.Attributes)
-		m.Attributes = &s
-	}
-
-	return m
 }
 
 // writeJSON sets the Content-Type + status and encodes v. Encode errors
