@@ -258,19 +258,27 @@ make up
 # 2. Register the canonical Avro schema with Schema Registry
 make register-schemas
 
-# 3. Run the four Go services (in separate terminals or backgrounded)
+# 3. Bring up the kind cluster and deploy all six services + the
+#    postgres-retention CronJob (Helm under deploy/helm/, ArgoCD
+#    Applications under deploy/argocd/apps/).
+./scripts/kind-up.sh
+./scripts/kind-deploy.sh
+
+# 3b. Or run the Go services on the host instead of kind (handy for `dlv`):
 go run ./cmd/ingest-api       &
 go run ./cmd/stream-processor &
 go run ./cmd/query-api        &
 go run ./cmd/clickhouse-sink  &
 
-# 4a. Pull live data from OpenSky (the primary path)
+# 4. Live data flows automatically once opensky-ingest is up — it polls
+#    OpenSky every 300s. To run the producer directly on the host instead:
 cd services/opensky-ingest && uv sync
 KAFKA_BROKERS=localhost:29092 \
 SCHEMA_REGISTRY_URL=http://localhost:8081 \
-uv run python opensky_ingest.py    # polls every 300s; ctrl-c to stop
+uv run python opensky_ingest.py
 
-# 4b. Or generate synthetic chaos data (dupes + out-of-order — only deterministic way to test those)
+# 4b. Synthetic chaos data (--duplicates / --out-of-order — the only
+#     deterministic way to test dedupe + timestamp-gated upsert):
 make generator-install
 cd tools/generator && uv run python gen.py \
   --rate 50 --duration 10 --entities 5 \
@@ -407,6 +415,17 @@ override-able via `pool_*` DSN params.
   `capabilities.drop: [ALL]`. `postgresSecret` value pattern for
   production DSN via `secretKeyRef`. `govulncheck` clean.
 
+### Retention summary
+
+- **Postgres `flight_telemetry`** — daily K8s CronJob
+  (`deploy/helm/postgres-retention/`) at 03:00 UTC deletes rows
+  older than 7 days. `aircraft_state` is bounded naturally
+  (~10k rows) and not pruned.
+- **ClickHouse `flight.telemetry`** — 180-day TTL declared in DDL;
+  hourly rollups 90 days; airspace grid 30 days.
+- **Iceberg `flight.telemetry`** — no TTL (long-term archive).
+- **Kafka `flight.telemetry`** — 48-hour log retention.
+
 ### Known limits (deferred)
 
 - No auth on ingest-api / query-api — expected to sit behind an API gateway.
@@ -415,7 +434,12 @@ override-able via `pool_*` DSN params.
 - Single Kafka broker, RF=1 — dev-only. Production needs RF≥3 + mTLS +
   SASL + an idempotent producer.
 - Observability stack is an opt-in compose override; Helm charts do not
-  install Prometheus/Grafana today.
+  install Prometheus/Grafana today (Prometheus is installed separately
+  in the kind cluster via `prometheus-community/prometheus`).
+- `opensky-ingest` runs anonymously on the OpenSky API (400 credits/day,
+  300s poll interval). Setting `OPENSKY_CLIENT_ID` /
+  `OPENSKY_CLIENT_SECRET` would lift to 4,000 credits/day; the OAuth2
+  flow itself is the only TODO in `opensky_ingest.py`.
 
 ## Phases
 
@@ -464,8 +488,9 @@ Built phase-by-phase. Each phase closed with an
 ├── deploy/
 │   ├── docker-compose.yml          # Local infra stack (kafka, postgres, ch, minio, iceberg-rest)
 │   ├── observability/              # Opt-in OTel + Prom + Grafana + Jaeger
-│   ├── helm/                       # Helm charts (Go services + 2 Python services)
-│   └── argocd/                     # App-of-apps: 6 ArgoCD Applications
+│   ├── helm/                       # 4 Go service charts + 2 Python service charts +
+│   │                               #   postgres-retention infra chart (CronJob, no image build)
+│   └── argocd/                     # App-of-apps: 7 ArgoCD Applications (6 services + retention)
 ├── loadtest/               # k6 scripts + chaos scenarios
 ├── scripts/                # Shell helpers (register-schemas, kind-up, smoke, ...)
 ├── .claude/                # Reviewer agents + /audit slash command
