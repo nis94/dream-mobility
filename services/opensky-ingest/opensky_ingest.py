@@ -13,10 +13,11 @@ ingest-api remains the entry point for *push* clients (curl, generator,
 external apps).
 
 Rate limit footgun: anonymous OpenSky access = 400 credits/day, 1 credit per
-/states/all call. POLL_INTERVAL_SECONDS=300 gives 288 polls/day; do NOT drop
-below ~215s without OAuth2 client credentials (4000 credits/day). The fetcher
-respects HTTP 429 with exponential backoff so a misconfigured deployment
-won't hammer OpenSky.
+/states/all call. POLL_INTERVAL_SECONDS=3600 (default) gives 24 polls/day, a
+deliberately conservative rate for a personal-learning deployment that mostly
+sits idle. Do NOT drop below ~215s without OAuth2 client credentials
+(4000 credits/day). The fetcher respects HTTP 429 with exponential backoff so
+a misconfigured deployment won't hammer OpenSky.
 
 Usage:
     uv run python opensky_ingest.py
@@ -29,7 +30,7 @@ Environment variables (override CLI defaults):
     OPENSKY_URL                  Override the OpenSky endpoint (default below)
     OPENSKY_CLIENT_ID            OAuth2 client id (optional; anonymous if unset)
     OPENSKY_CLIENT_SECRET        OAuth2 client secret (optional)
-    POLL_INTERVAL_SECONDS        Seconds between polls (default: 300)
+    POLL_INTERVAL_SECONDS        Seconds between polls (default: 3600)
     OTEL_EXPORTER_OTLP_ENDPOINT  OTLP collector URL (default: http://localhost:4318)
     LOG_LEVEL                    DEBUG/INFO/WARN/ERROR (default: INFO)
 """
@@ -348,7 +349,7 @@ def run(args: argparse.Namespace) -> None:
 
 def _sleep_until(deadline: float, alive) -> None:
     """Sleep in 0.5s slices so SIGTERM is honored within half a second
-    even when the poll interval is 5 minutes."""
+    regardless of the total wait (default poll interval is 1 hour)."""
     while alive() and time.monotonic() < deadline:
         time.sleep(min(0.5, deadline - time.monotonic()))
 
@@ -367,7 +368,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--poll-interval", type=float,
-        default=float(os.getenv("POLL_INTERVAL_SECONDS", "300")),
+        default=float(os.getenv("POLL_INTERVAL_SECONDS", "3600")),
     )
     p.add_argument("--opensky-client-id", default=os.getenv("OPENSKY_CLIENT_ID"))
     p.add_argument("--opensky-client-secret", default=os.getenv("OPENSKY_CLIENT_SECRET"))

@@ -325,11 +325,21 @@ sub-second reads. Each sink writes only what its store was built for.
 
 ---
 
-## 6. Observability — OpenTelemetry, Prometheus, Grafana, Jaeger
+## 6. Observability — OpenTelemetry, Prometheus, Grafana
 
 The stack produces three signals: **logs, metrics, traces**. Each
 lands in a different place, and one SDK (OpenTelemetry) emits all
 three.
+
+> **Note:** Jaeger has been removed from the local observability
+> overlay because the all-in-one image grew unbounded under sustained
+> trace volume on Docker Desktop. Traces are still emitted to the
+> OTel collector — they're just exported to its `debug` exporter
+> (stdout) rather than to a UI. The architectural reasoning below
+> stands; the rest of §6.4 describes Jaeger's role for context and
+> for the moment we re-enable it. To restore a UI, add a Tempo or
+> Jaeger exporter back to `deploy/observability/otel-collector.yaml`
+> and a corresponding service block to the observability compose.
 
 ### OpenTelemetry
 
@@ -364,10 +374,11 @@ alerting.
 ### Grafana
 
 The single pane. One datasource per signal source: Prometheus for
-metrics, Jaeger for traces (wired via the Jaeger datasource so you
-can click through traces from time-series panels). We have a small
-hand-built dashboard (`Dream Flight — Runtime`) showing
-per-instance Go runtime state and scrape health.
+metrics, Postgres for the Live Flights dashboard, and (when Jaeger
+is re-enabled) a Jaeger datasource for trace drill-down from
+time-series panels. We have a small hand-built dashboard
+(`Dream Flight — Runtime`) showing per-instance Go runtime state
+and scrape health.
 
 ### Jaeger
 

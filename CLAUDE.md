@@ -42,12 +42,13 @@ loopback interface. To enable anonymous MinIO read on the lake bucket
 ## OpenSky rate limit footgun
 
 - `services/opensky-ingest` polls `https://opensky-network.org/api/states/all`
-  on `POLL_INTERVAL_SECONDS` (default 300s). **Anonymous = 400 credits/day,
-  1 credit per call.** 300s = 288 polls/day, comfortably under the cap.
-  **Do NOT drop below ~215s** without OAuth2 client credentials
-  (4000 credits/day). The fetcher backs off exponentially on HTTP 429,
-  so a misconfigured deployment won't hammer OpenSky, but it WILL stop
-  ingesting until the 24h credit window resets.
+  on `POLL_INTERVAL_SECONDS` (default **3600s** — 24 polls/day).
+  **Anonymous = 400 credits/day, 1 credit per call.** The default is
+  deliberately conservative for a personal learning project that mostly
+  sits idle. **Do NOT drop below ~215s** without OAuth2 client
+  credentials (4000 credits/day). The fetcher backs off exponentially
+  on HTTP 429, so a misconfigured deployment won't hammer OpenSky, but
+  it WILL stop ingesting until the 24h credit window resets.
 - `replicaCount` is hardcoded to 1 in `deploy/helm/opensky-ingest/templates/deployment.yaml`.
   Multiple replicas would each independently poll and produce duplicates of
   every observation; HA would need leader election (out of scope today).
@@ -113,9 +114,11 @@ loopback interface. To enable anonymous MinIO read on the lake bucket
   Go→Go→Python. clickhouse-sink is not yet instrumented.
 - Prometheus is reachable from Grafana at
   `http://df-prometheus:9090` (the docker-network hostname), not
-  `localhost`. Jaeger is reachable the same way at
-  `http://df-jaeger:16686`. Datasources are provisioned by hand
-  today (`curl -u admin:admin -X POST /api/datasources`).
+  `localhost`. **Jaeger has been removed** from the observability
+  overlay (was a memory hog at idle); the OTel collector now exports
+  traces to its `debug` exporter only — visible via
+  `docker logs df-otel-collector`. Datasources are provisioned via
+  `deploy/grafana/provisioning/datasources/datasources.yaml`.
 - Grafana runs with anonymous Viewer + `admin/admin` for edit. Dev-only.
 - `deploy/observability/prometheus.yml` statically scrapes three
   `stream-processor` ports (9466/9476/9486) so three local replicas

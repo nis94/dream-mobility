@@ -1,5 +1,8 @@
 # OpenTelemetry Collector configuration for local development.
-# Receives OTLP/HTTP traces on :4318, exports to Jaeger via OTLP/gRPC.
+# Receives OTLP/HTTP traces on :4318, exports to the debug exporter
+# (stdout). Visible via `docker logs df-otel-collector`. To restore a
+# trace UI, add a Tempo or Jaeger exporter here and re-add it to the
+# pipeline below.
 # Service metrics are scraped directly by Prometheus from the services'
 # /metrics endpoints — this collector does not have a metrics pipeline.
 
@@ -21,10 +24,6 @@ processors:
 exporters:
   debug:
     verbosity: basic
-  otlp/jaeger:
-    endpoint: "jaeger:4317"
-    tls:
-      insecure: true
 
 service:
   extensions: [health_check]
@@ -32,4 +31,4 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug, otlp/jaeger]
+      exporters: [debug]

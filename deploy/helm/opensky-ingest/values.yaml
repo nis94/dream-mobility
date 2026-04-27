@@ -14,9 +14,10 @@ env:
   SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
   OPENSKY_URL: "https://opensky-network.org/api/states/all"
   # Anonymous OpenSky access = 400 credits/day = 1 credit per /states/all
-  # call. 300s = 288 polls/day, comfortably under the limit. Drop below 215s
-  # only with OAuth2 client credentials (4000/day).
-  POLL_INTERVAL_SECONDS: "300"
+  # call. 3600s = 24 polls/day, deliberately conservative for a personal
+  # learning project that mostly sits idle. Drop below 215s only with
+  # OAuth2 client credentials (4000/day).
+  POLL_INTERVAL_SECONDS: "3600"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
   LOG_LEVEL: "INFO"
 

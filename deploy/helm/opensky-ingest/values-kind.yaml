@@ -9,6 +9,6 @@ env:
   KAFKA_TOPIC: "flight.telemetry"
   SCHEMA_REGISTRY_URL: "http://host.docker.internal:8081"
   OPENSKY_URL: "https://opensky-network.org/api/states/all"
-  POLL_INTERVAL_SECONDS: "300"
+  POLL_INTERVAL_SECONDS: "3600"
   OTEL_EXPORTER_OTLP_ENDPOINT: "http://host.docker.internal:4318"
   LOG_LEVEL: "DEBUG"

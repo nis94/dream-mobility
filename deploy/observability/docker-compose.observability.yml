@@ -3,7 +3,8 @@
 #   docker compose -f deploy/docker-compose.yml \
 #                  -f deploy/observability/docker-compose.observability.yml up -d
 #
-# Adds: OTel Collector, Jaeger (trace viewer), Prometheus, Grafana.
+# Adds: OTel Collector, Prometheus, Grafana.
+# (Jaeger removed — see otel-collector.yaml header for restoration notes.)
 #
 # DEV-ONLY stack. No credentials are protected. Do not expose these ports
 # on any shared network without a reverse proxy + auth in front.
@@ -28,24 +29,9 @@ services:
       # inject OTel traffic into the dev collector.
       - "127.0.0.1:4318:4318"    # OTLP/HTTP receiver
       - "127.0.0.1:13133:13133"  # health_check extension
-    depends_on:
-      jaeger:
-        condition: service_healthy
     # No healthcheck: the otel-collector-contrib image is distroless (no
     # wget/curl/shell), so any CMD-based probe fails. The collector crash-
     # loops loudly on a real error, which is the practical signal here.
-
-  jaeger:
-    image: jaegertracing/all-in-one:1.58
-    container_name: df-jaeger
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
-    ports:
-      - "127.0.0.1:16686:16686"  # Jaeger UI
-      - "127.0.0.1:4317:4317"    # OTLP/gRPC (used by collector)
-    healthcheck:
-      <<: *hc-defaults
-      test: ["CMD", "wget", "-qO-", "http://localhost:14269/"]
 
   prometheus:
     image: prom/prometheus:v2.53.0

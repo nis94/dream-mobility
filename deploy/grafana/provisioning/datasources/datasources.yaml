@@ -24,20 +24,6 @@ datasources:
     isDefault: true
     editable: false
 
-  # Jaeger lives alongside Grafana in the observability compose overlay.
-  # Same docker network, so we reach it by its compose service name.
-  - name: Jaeger
-    uid: jaeger
-    type: jaeger
-    access: proxy
-    url: http://df-jaeger:16686
-    editable: false
-    jsonData:
-      # Clicking a span in the trace view offers a "View logs / metrics"
-      # drill-down via the Prometheus datasource above.
-      tracesToMetrics:
-        datasourceUid: prometheus
-
   # Postgres feeds the aviation Live Flights dashboard. The data is in
   # flight_telemetry (raw) and aircraft_state (latest per icao24).
   # ClickHouse rollups exist with richer rollups (country / airline / grid)

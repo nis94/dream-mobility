@@ -20,7 +20,7 @@ OpenTelemetry.
 
 | Capability | Path | Latency target |
 |---|---|---|
-| Real-time ingest from OpenSky | `opensky-ingest` polls `/states/all` every 300s | sub-second per poll |
+| Real-time ingest from OpenSky | `opensky-ingest` polls `/states/all` every 3600s (default; configurable) | sub-second per poll |
 | Push-side ingest (smoke / chaos / external apps) | HTTP `POST /events` on ingest-api | <50 ms p99 |
 | Deliver to every downstream store | Kafka `flight.telemetry` → independent consumer groups | seconds |
 | Last-known state for an aircraft | HTTP `GET /aircraft/{icao24}` | <20 ms p99 (point read) |
@@ -342,15 +342,17 @@ the leaderboard of operator countries — typically US, UK, Germany on top.
 | Iceberg REST | <http://localhost:8181> | `s3://lake/` warehouse |
 | Prometheus `/metrics` per service | `:9464` / `:9465` / `:9466` / `:9467` | ingest / query / processor / ch-sink |
 
-Optional observability stack (Prometheus + Grafana + Jaeger + OTel Collector):
+Optional observability stack (Prometheus + Grafana + OTel Collector):
 
 ```bash
 docker compose \
   -f deploy/docker-compose.yml \
   -f deploy/observability/docker-compose.observability.yml up -d
 # Grafana: http://localhost:3000 (anonymous Viewer, admin/admin for edit)
-# Jaeger:  http://localhost:16686
 # Prom:    http://localhost:9090
+# Traces:  exported to the OTel collector debug exporter (stdout) only —
+#          `docker logs df-otel-collector`. Add a Tempo/Jaeger exporter
+#          back in deploy/observability/otel-collector.yaml if you want a UI.
 ```
 
 ## Configuration
@@ -368,7 +370,7 @@ All services read env vars via `internal/config`.
 | `SCHEMA_REGISTRY_URL` | ingest-api / opensky-ingest | `http://localhost:8081` | SR endpoint |
 | `POSTGRES_DSN` | stream-processor / query-api | `postgres://postgres:postgres@localhost:5432/flight?sslmode=disable` | DSN; **logged with password stripped** via `config.RedactDSN` |
 | `CLICKHOUSE_ADDR` / `CLICKHOUSE_DB` | clickhouse-sink | `localhost:9000` / `flight` | Native protocol |
-| `POLL_INTERVAL_SECONDS` | opensky-ingest | `300` | OpenSky polling cadence; anonymous limit 400 credits/day → don't drop below 215s |
+| `POLL_INTERVAL_SECONDS` | opensky-ingest | `3600` | OpenSky polling cadence; anonymous limit 400 credits/day → don't drop below 215s |
 | `CLICKHOUSE_BATCH_SIZE` / `CLICKHOUSE_BATCH_TIMEOUT` / `CLICKHOUSE_BUFFER_MAX` | clickhouse-sink | `5000` / `2s` / `20000` | Batch + backpressure tuning |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | `http://localhost:4318` | OTLP/HTTP receiver |
 | `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `ICEBERG_CATALOG_URI` / `ICEBERG_CATALOG_TOKEN` | archiver / lake-query | (**no default for secrets**) | Iceberg side |
@@ -391,7 +393,7 @@ override-able via `pool_*` DSN params.
 | Live data source | `opensky-ingest` (Python) polling OpenSky `/states/all` direct → Kafka | Pull-based source has no reason to round-trip through HTTP; ingest-api stays for push clients |
 | Python role | Live producer + Iceberg archiver + chaos generator + DuckDB CLI | PyIceberg + confluent-kafka-python are more ergonomic for Iceberg + adapter shapes |
 | Orchestration | docker-compose primary; Helm charts + ArgoCD for kind | Fast iteration locally; ArgoCD app-of-apps is the declarative path |
-| Observability | OpenTelemetry → Prometheus + Grafana + Jaeger | One SDK, three signals; end-to-end traces on demand |
+| Observability | OpenTelemetry → Prometheus + Grafana (Jaeger removed for memory; OTel debug exporter only) | One SDK; metrics + logs in Grafana; trace UI is opt-in |
 | Containers | distroless + non-root UID 65532 | Smallest attack surface |
 
 ## Operational properties
@@ -487,7 +489,7 @@ Built phase-by-phase. Each phase closed with an
 │   └── lake-query/         # DuckDB-over-Iceberg CLI
 ├── deploy/
 │   ├── docker-compose.yml          # Local infra stack (kafka, postgres, ch, minio, iceberg-rest)
-│   ├── observability/              # Opt-in OTel + Prom + Grafana + Jaeger
+│   ├── observability/              # Opt-in OTel + Prom + Grafana (Jaeger removed)
 │   ├── helm/                       # 4 Go service charts + 2 Python service charts +
 │   │                               #   postgres-retention infra chart (CronJob, no image build)
 │   └── argocd/                     # App-of-apps: 7 ArgoCD Applications (6 services + retention)
