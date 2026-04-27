@@ -49,6 +49,23 @@ func TestSplitStatements_EmptyInput(t *testing.T) {
 	}
 }
 
+func TestNarrowCategory(t *testing.T) {
+	if got := narrowCategory(nil); got != nil {
+		t.Errorf("narrowCategory(nil) = %v, want nil", got)
+	}
+	cases := []int{0, 5, 20}
+	for _, in := range cases {
+		got := narrowCategory(&in)
+		if got == nil {
+			t.Errorf("narrowCategory(&%d) = nil, want non-nil", in)
+			continue
+		}
+		if *got != int8(in) {
+			t.Errorf("narrowCategory(&%d) = %d, want %d", in, *got, in)
+		}
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	cases := []struct {
 		in   string

@@ -196,10 +196,14 @@ func (s *Sink) writeBatch(ctx context.Context, events []*avroschema.FlightTeleme
 	for _, ev := range events {
 		// ClickHouse-go maps Go bool → UInt8 for the on_ground / spi columns
 		// in the new schema, so passing the bool directly is correct.
+		// Category is a special case: the Avro decoder hands us *int (Go's
+		// native int = 64-bit on our targets) but the column is Int8 — the
+		// driver refuses to silently truncate, so we narrow here. OpenSky's
+		// category range is 0..20 so the cast is lossless.
 		if err := batch.Append(
 			ev.EventID, ev.Icao24, ev.Callsign, ev.OriginCountry, ev.ObservedAt, ev.PositionSource,
 			ev.Lat, ev.Lon, ev.BaroAltitudeM, ev.GeoAltitudeM, ev.VelocityMs, ev.TrueTrackDeg,
-			ev.VerticalRateMs, ev.OnGround, ev.Squawk, ev.Spi, ev.Category,
+			ev.VerticalRateMs, ev.OnGround, ev.Squawk, ev.Spi, narrowCategory(ev.Category),
 		); err != nil {
 			return fmt.Errorf("append to batch: %w", err)
 		}
@@ -247,6 +251,19 @@ func splitStatements(sql string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// narrowCategory maps the Avro-side *int (64-bit on our targets) to *int8 so
+// the clickhouse-go driver accepts it for the Nullable(Int8) column. nil maps
+// to nil. The OpenSky category range (0..20) fits in Int8 — out-of-range
+// values are truncated rather than rejected, since the schema-level cap is
+// enforced upstream by the API validator.
+func narrowCategory(c *int) *int8 {
+	if c == nil {
+		return nil
+	}
+	v := int8(*c)
+	return &v
 }
 
 func truncate(s string, n int) string {
